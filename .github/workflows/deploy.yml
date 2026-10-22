@@ -13,11 +13,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
       - name: サービスアカウントの鍵を用意
         env:
@@ -30,6 +30,20 @@ jobs:
           printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
 
-      - name: Hosting と Firestore ルールをデプロイ
+      - name: Hosting（サイト本体）をデプロイ
         if: env.GOOGLE_APPLICATION_CREDENTIALS != ''
-        run: npx --yes firebase-tools@13 deploy --only hosting,firestore --project point-check-9ca84 --non-interactive
+        run: |
+          set -o pipefail
+          npx --yes firebase-tools@13 deploy --only hosting --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/hosting.log" || {
+            tail -n 25 "$RUNNER_TEMP/hosting.log" | sed 's/^/::error title=Hosting のデプロイに失敗::/'
+            exit 1
+          }
+
+      - name: Firestore ルールをデプロイ
+        if: always() && env.GOOGLE_APPLICATION_CREDENTIALS != ''
+        run: |
+          set -o pipefail
+          npx --yes firebase-tools@13 deploy --only firestore --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/firestore.log" || {
+            tail -n 25 "$RUNNER_TEMP/firestore.log" | sed 's/^/::error title=Firestore ルールのデプロイに失敗::/'
+            exit 1
+          }
