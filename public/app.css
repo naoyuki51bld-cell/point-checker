@@ -228,3 +228,30 @@ th.sticky { background: var(--box); z-index: 2; }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(18px + env(safe-area-inset-bottom)); background: var(--ink); color: var(--bg); padding: 8px 16px; border-radius: 8px; font-size: .9rem; z-index: 50; max-width: calc(100% - 32px); }
 .pw-list td { font-family: var(--f-num); }
 @media (prefers-reduced-motion: no-preference) { .btn, .tab { transition: background .15s, border-color .15s, color .15s; } }
+
+/* テストの記入欄 */
+.qwrap { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 10px; align-items: stretch; }
+.qgrid { grid-template-columns: repeat(auto-fill, minmax(124px, 1fr)); }
+.big-total .v { font-size: 1.4rem; }
+@media (max-width: 520px) { .qwrap { grid-template-columns: minmax(0, 1fr); } .qgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.target { max-width: 360px; }
+.goal-card .row h2 { margin-right: 8px; }
+.goal-input input { width: 5em; }
+
+/* 得点分布 */
+.dist { display: flex; flex-direction: column; gap: 4px; }
+.dist-row { display: grid; grid-template-columns: 7.5em minmax(0, 1fr) 3.5em 3.5em; gap: 8px; align-items: center; font-size: .88rem; padding: 2px 4px; border-radius: 4px; }
+.dist-row.me { background: var(--accent-soft); font-weight: 700; }
+.dist-l { text-align: right; color: var(--muted); }
+.dist-bar { height: 14px; background: var(--track); border-radius: 3px; overflow: hidden; }
+.dist-bar span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.dist-row.me .dist-bar span { background: var(--navy); }
+.dist-n { text-align: right; }
+.dist-me { color: var(--accent); font-size: .78rem; }
+.dist p { margin-top: 6px; }
+
+/* 編集画面 */
+.ed-q { grid-template-columns: 6em minmax(0, 1fr) 6em auto; }
+@media (max-width: 520px) { .ed-q { grid-template-columns: 5em minmax(0, 1fr) 5em; } .ed-q > span:last-child { grid-column: 1 / -1; justify-self: end; } }
+.set-member { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+td.wrap { white-space: normal; min-width: 12em; }

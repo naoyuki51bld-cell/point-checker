@@ -2,36 +2,13 @@
 
 export const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
-// 得点表の構造から、回・セット・分野ごとの問題リストを作る
-export function indexWorkbook(wb) {
-  const all = [];
-  const rounds = new Map();
-  const sets = new Map();
-  const fields = new Map((wb.fields || []).map((f) => [f.id, []]));
-  for (const set of wb.sets || []) {
-    const setItems = [];
-    for (const round of set.rounds || []) {
-      const roundItems = [];
-      for (const item of round.items || []) {
-        const it = { ...item, roundId: round.id, setId: set.id, roundLabel: round.label };
-        all.push(it);
-        roundItems.push(it);
-        setItems.push(it);
-        if (fields.has(item.fieldId)) fields.get(item.fieldId).push(it);
-      }
-      rounds.set(round.id, roundItems);
-    }
-    sets.set(set.id, setItems);
-  }
-  return { all, rounds, sets, fields };
-}
-
 // 0〜満点の範囲にある点数だけを有効とみなす
 export function validScore(item, scores) {
   const v = scores ? scores[item.id] : undefined;
   return isNum(v) && v >= 0 && v <= item.max ? v : null;
 }
 
+// 問題の集まり（テスト1回分、セット全体、ある分野だけ…）について、ある生徒の得点をまとめる
 export function evalGroup(items, scores) {
   let sum = 0, max = 0, count = 0, enteredMax = 0;
   for (const it of items) {
@@ -48,53 +25,42 @@ export function evalGroup(items, scores) {
 
 export function describe(values) {
   const n = values.length;
-  if (!n) return { n: 0, avg: null, sd: null, max: null };
+  if (!n) return { n: 0, avg: null, sd: null, max: null, min: null };
   const avg = values.reduce((a, b) => a + b, 0) / n;
   const sd = Math.sqrt(values.reduce((a, b) => a + (b - avg) ** 2, 0) / n);
-  return { n, avg, sd, max: Math.max(...values) };
+  return { n, avg, sd, max: Math.max(...values), min: Math.min(...values) };
 }
 
 export const rankOf = (values, v) => 1 + values.filter((x) => x > v + 1e-9).length;
 
-// allScores: { uid: { itemId: score } }（生徒全員分）
-// 回・セットは「全問入力済み」の人どうしで合計点を比較。
-// 分野・全体は「入力済みの問題の得点率」で比較（進み具合が違っても比べられるように）。
-export function computeStats(wb, allScores, myUid) {
-  const idx = indexWorkbook(wb);
-  const uids = Object.keys(allScores);
-  const out = { students: uids.length, items: {}, rounds: {}, sets: {}, fields: {}, overall: null };
+export const deviation = (v, d) => (d && d.n > 1 && d.sd > 0 ? 50 + (10 * (v - d.avg)) / d.sd : 50);
 
-  for (const it of idx.all) {
-    const vals = uids.map((u) => validScore(it, allScores[u])).filter((v) => v !== null);
-    out.items[it.id] = describe(vals);
+// allScores: { uid: { itemId: score } }
+// mode 'complete': 全問記入した人どうしで合計点を比べる（テスト1回分の比較に使う）
+// mode 'rate'    : 1問以上記入した人どうしで、記入済みの問題の得点率を比べる（分野・セットの比較に使う）
+export function compare(items, allScores, myUid, mode = 'complete') {
+  const values = [];
+  let mine = null;
+  for (const [uid, scores] of Object.entries(allScores)) {
+    const g = evalGroup(items, scores);
+    const ok = mode === 'complete' ? g.complete : g.count > 0;
+    if (!ok) continue;
+    const v = mode === 'complete' ? g.sum : g.rate;
+    values.push(v);
+    if (uid === myUid) mine = v;
   }
-
-  const byComplete = (items) => {
-    const vals = [];
-    let mine = null;
-    for (const u of uids) {
-      const g = evalGroup(items, allScores[u]);
-      if (g.complete) { vals.push(g.sum); if (u === myUid) mine = g.sum; }
-    }
-    const d = describe(vals);
-    return { ...d, rank: mine !== null ? rankOf(vals, mine) : null };
-  };
-  const byRate = (items) => {
-    const vals = [];
-    let mine = null;
-    for (const u of uids) {
-      const g = evalGroup(items, allScores[u]);
-      if (g.count > 0) { vals.push(g.rate); if (u === myUid) mine = g.rate; }
-    }
-    const d = describe(vals);
-    return { ...d, rank: mine !== null ? rankOf(vals, mine) : null };
-  };
-
-  for (const [id, items] of idx.rounds) out.rounds[id] = byComplete(items);
-  for (const [id, items] of idx.sets) out.sets[id] = byComplete(items);
-  for (const [id, items] of idx.fields) out.fields[id] = byRate(items);
-  out.overall = byRate(idx.all);
-  return out;
+  const d = describe(values);
+  return { ...d, values, mine, rank: mine !== null ? rankOf(values, mine) : null };
 }
 
-export const deviation = (v, d) => (d && d.n > 1 && d.sd > 0 ? 50 + (10 * (v - d.avg)) / d.sd : 50);
+// 得点分布: 0〜max を bins 個の区間に分けて人数を数える（最後の区間は満点を含む）
+export function histogram(values, max, bins = 10) {
+  const width = max / bins;
+  const out = Array.from({ length: bins }, (_, i) => ({ lo: i * width, hi: (i + 1) * width, count: 0 }));
+  for (const v of values) {
+    const i = Math.min(bins - 1, Math.max(0, Math.floor(v / width + 1e-9)));
+    out[i].count++;
+  }
+  return out;
+}
+export const binOf = (v, max, bins = 10) => Math.min(bins - 1, Math.max(0, Math.floor(v / (max / bins) + 1e-9)));

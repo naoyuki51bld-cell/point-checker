@@ -4,9 +4,13 @@ rules_version = '2';
 // - users/{uid}        : プロフィール（生徒: studentNo / 先生: email、role = 'student' | 'teacher'）
 // - config/teachers    : 先生として登録できるメールアドレスの一覧（先生だけが読み書き）
 // - config/settings    : 生徒の自己登録を受け付けるか（だれでも読める・先生だけが書ける）
-// - workbooks/{id}     : 得点表の構成（先生が作成。公開中のものだけ生徒が読める）
-// - scores/{wb_uid}    : 生徒の点数（平均・順位の計算のため、ログイン済みなら読める。名前は含まない）
-// - notes/{wb_uid}     : 目標点・振り返りメモ（本人と先生だけ）
+// - fieldLists/{cat}   : タブ（kyotsu / other）ごとの分野リスト（先生が編集）
+// - tests/{id}         : テスト1回分の問題（先生が作成。公開中のものだけ生徒が読める）
+// - sets/{id}          : テストのまとまり（先生が作成。公開中のものだけ生徒が読める）
+// - scores/{test_uid}  : 生徒の点数（平均・順位・分布の計算のため、ログイン済みなら読める。名前は含まない）
+// - notes/{test_uid}   : テストごとの目標点・振り返りメモ（本人と先生だけ）
+// - goals/{uid}        : 共通テストの目標点（100点満点あたり。本人と先生だけ）
+// - workbooks/{id}     : 以前の形式の得点表（変換用。先生だけ）
 //
 // ※ studentEmailDomain() は public/firebase-config.js の studentEmailDomain と同じ値にしてください。
 
@@ -76,9 +80,25 @@ service cloud.firestore {
       allow delete: if isTeacher() && request.auth.uid != uid;
     }
 
-    match /workbooks/{wbId} {
+    // 分野リスト（タブごとに1つ: kyotsu / other）
+    match /fieldLists/{cat} {
+      allow read: if hasProfile();
+      allow write: if isTeacher() && cat in ['kyotsu', 'other'];
+    }
+
+    match /tests/{testId} {
       allow read: if isTeacher() || (hasProfile() && resource.data.published == true);
       allow write: if isTeacher();
+    }
+
+    match /sets/{setId} {
+      allow read: if isTeacher() || (hasProfile() && resource.data.published == true);
+      allow write: if isTeacher();
+    }
+
+    // 以前の形式（変換のために先生だけが読み書き）
+    match /workbooks/{wbId} {
+      allow read, write: if isTeacher();
     }
 
     match /scores/{docId} {
@@ -86,18 +106,18 @@ service cloud.firestore {
       allow create, update: if (
           isStudent()
           && request.resource.data.uid == request.auth.uid
-          && docId == request.resource.data.wbId + '_' + request.auth.uid
-          && request.resource.data.keys().hasOnly(['wbId', 'uid', 'scores', 'dates', 'updatedAt'])
+          && docId == request.resource.data.testId + '_' + request.auth.uid
+          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'date', 'updatedAt'])
           && request.resource.data.scores is map
-          && exists(/databases/$(database)/documents/workbooks/$(request.resource.data.wbId))
+          && exists(/databases/$(database)/documents/tests/$(request.resource.data.testId))
         ) || (
           // 先生による点数の記入・修正（生徒のアカウントに対してだけ）
           isTeacher()
-          && docId == request.resource.data.wbId + '_' + request.resource.data.uid
-          && (resource == null || (request.resource.data.uid == resource.data.uid && request.resource.data.wbId == resource.data.wbId))
-          && request.resource.data.keys().hasOnly(['wbId', 'uid', 'scores', 'dates', 'updatedAt'])
+          && docId == request.resource.data.testId + '_' + request.resource.data.uid
+          && (resource == null || (request.resource.data.uid == resource.data.uid && request.resource.data.testId == resource.data.testId))
+          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'date', 'updatedAt'])
           && request.resource.data.scores is map
-          && exists(/databases/$(database)/documents/workbooks/$(request.resource.data.wbId))
+          && exists(/databases/$(database)/documents/tests/$(request.resource.data.testId))
           && get(userPath(request.resource.data.uid)).data.role == 'student'
         );
       allow delete: if isTeacher();
@@ -107,10 +127,19 @@ service cloud.firestore {
       allow read: if isTeacher() || (signedIn() && docId.matches('.+_' + request.auth.uid));
       allow create, update: if isStudent()
         && request.resource.data.uid == request.auth.uid
-        && docId == request.resource.data.wbId + '_' + request.auth.uid
-        && request.resource.data.keys().hasOnly(['wbId', 'uid', 'goal', 'entries', 'updatedAt'])
-        && request.resource.data.entries is map;
+        && docId == request.resource.data.testId + '_' + request.auth.uid
+        && request.resource.data.keys().hasOnly(['testId', 'uid', 'target', 'memo', 'updatedAt'])
+        && (request.resource.data.memo is string && request.resource.data.memo.size() <= 1000);
       allow delete: if isTeacher();
+    }
+
+    // 共通テストの目標点（生徒ごとに1つ）
+    match /goals/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isTeacher());
+      allow create, update: if isStudent() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['kyotsu', 'updatedAt'])
+        && (request.resource.data.kyotsu == null || (request.resource.data.kyotsu is number && request.resource.data.kyotsu >= 0 && request.resource.data.kyotsu <= 100));
+      allow delete: if isTeacher() || (signedIn() && request.auth.uid == uid);
     }
   }
 }
