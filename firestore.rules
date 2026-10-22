@@ -1,0 +1,99 @@
+rules_version = '2';
+
+// デジタル得点表 のセキュリティルール
+// - users/{uid}      : プロフィール（役割 role = 'teacher' | 'student'）
+// - config/secret    : 登録コード（教師だけが読み書き）
+// - workbooks/{id}   : 得点表の構成（教師が作成。公開中のものだけ生徒が読める）
+// - scores/{wb_uid}  : 生徒の点数（平均・順位の計算のため、ログイン済みなら読める。名前は含まない）
+// - notes/{wb_uid}   : 目標点・振り返りメモ（本人と教師だけ）
+//
+// ※ USERNAME_DOMAIN は public/firebase-config.js の usernameDomain と同じ値にしてください。
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function myRole() { return get(userPath(request.auth.uid)).data.role; }
+    function isTeacher() { return hasProfile() && myRole() == 'teacher'; }
+    function isStudent() { return hasProfile() && myRole() == 'student'; }
+    function secret() { return get(/databases/$(database)/documents/config/secret).data; }
+    function usernameDomain() { return 'score-note.local'; }
+
+    function validProfile(d) {
+      return d.keys().hasOnly(['username', 'displayName', 'role', 'className', 'number',
+                               'mustChangePassword', 'createdAt', 'joinCode'])
+        && d.keys().hasAll(['username', 'displayName', 'role'])
+        && d.username is string && d.username.matches('^[a-z0-9._-]{3,30}$')
+        && d.displayName is string && d.displayName.size() > 0 && d.displayName.size() <= 40
+        && d.role in ['student', 'teacher']
+        && (!('className' in d) || (d.className is string && d.className.size() <= 20))
+        && (!('number' in d) || d.number == null || d.number is int);
+    }
+
+    function codeMatches(role, code) {
+      return exists(/databases/$(database)/documents/config/secret)
+        && (role == 'student' ? secret().get('studentCode', '') : secret().get('teacherCode', '')) == code
+        && code is string && code.size() > 0;
+    }
+
+    match /config/secret {
+      allow read, write: if isTeacher();
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isTeacher());
+
+      // 本人による新規登録（登録コードが必要）または教師によるアカウント作成
+      allow create: if validProfile(request.resource.data) && (
+        (signedIn() && request.auth.uid == uid
+          && request.auth.token.email == request.resource.data.username + '@' + usernameDomain()
+          && codeMatches(request.resource.data.role, request.resource.data.get('joinCode', '')))
+        || isTeacher()
+      );
+
+      // 本人は「初回パスワード変更済み」の印だけ更新できる。教師はすべて更新できる。
+      allow update: if (signedIn() && request.auth.uid == uid
+                         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mustChangePassword'])
+                         && request.resource.data.mustChangePassword == false)
+                    || (isTeacher() && validProfile(request.resource.data)
+                         && request.resource.data.username == resource.data.username);
+
+      allow delete: if isTeacher() && request.auth.uid != uid;
+    }
+
+    match /workbooks/{wbId} {
+      allow read: if isTeacher() || (hasProfile() && resource.data.published == true);
+      allow write: if isTeacher();
+    }
+
+    match /scores/{docId} {
+      allow read: if hasProfile();
+      allow create, update: if (
+          isStudent()
+          && request.resource.data.uid == request.auth.uid
+          && docId == request.resource.data.wbId + '_' + request.auth.uid
+          && request.resource.data.keys().hasOnly(['wbId', 'uid', 'scores', 'dates', 'updatedAt'])
+          && request.resource.data.scores is map
+          && exists(/databases/$(database)/documents/workbooks/$(request.resource.data.wbId))
+        ) || (
+          isTeacher() && resource != null
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.wbId == resource.data.wbId
+          && request.resource.data.scores is map
+        );
+      allow delete: if isTeacher();
+    }
+
+    match /notes/{docId} {
+      allow read: if isTeacher() || (signedIn() && docId.matches('.+_' + request.auth.uid));
+      allow create, update: if isStudent()
+        && request.resource.data.uid == request.auth.uid
+        && docId == request.resource.data.wbId + '_' + request.auth.uid
+        && request.resource.data.keys().hasOnly(['wbId', 'uid', 'goal', 'entries', 'updatedAt'])
+        && request.resource.data.entries is map;
+      allow delete: if isTeacher();
+    }
+  }
+}

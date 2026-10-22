@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>デジタル得点表</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700&family=Roboto+Mono:wght@500;600&display=swap">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar" id="topbar" hidden>
+    <div class="topbar-inner">
+      <a class="brand" href="#/" id="brand">デジタル得点表</a>
+      <nav class="nav" id="nav"></nav>
+    </div>
+  </header>
+  <main id="app" class="main">
+    <p class="loading">読み込み中…</p>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

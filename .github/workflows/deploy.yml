@@ -1,0 +1,35 @@
+name: Firebase にデプロイ
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: firebase-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: サービスアカウントの鍵を用意
+        env:
+          SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$SA_JSON" ]; then
+            echo "::warning::GitHub の Secrets に FIREBASE_SERVICE_ACCOUNT が未登録のため、デプロイを省略しました（README 参照）。"
+            exit 0
+          fi
+          printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
+
+      - name: Hosting と Firestore ルールをデプロイ
+        if: env.GOOGLE_APPLICATION_CREDENTIALS != ''
+        run: npx --yes firebase-tools@13 deploy --only hosting,firestore --project point-check-9ca84 --non-interactive
