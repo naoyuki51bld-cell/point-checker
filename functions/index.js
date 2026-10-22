@@ -12,7 +12,7 @@ const REGION = 'asia-northeast1';
 async function assertTeacher(req) {
   if (!req.auth) throw new HttpsError('unauthenticated', 'ログインしてください。');
   const me = await getFirestore().doc(`users/${req.auth.uid}`).get();
-  if (!me.exists || me.get('role') !== 'teacher') throw new HttpsError('permission-denied', '教師のみ実行できます。');
+  if (!me.exists || me.get('role') !== 'teacher') throw new HttpsError('permission-denied', '先生のみ実行できます。');
 }
 
 function targetUid(req) {
@@ -31,7 +31,8 @@ exports.resetPassword = onCall({ region: REGION }, async (req) => {
   await assertTeacher(req);
   const uid = targetUid(req);
   const profile = getFirestore().doc(`users/${uid}`);
-  if (!(await profile.get()).exists) throw new HttpsError('not-found', 'ユーザーが見つかりません。');
+  const snap = await profile.get();
+  if (!snap.exists || snap.get('role') !== 'student') throw new HttpsError('not-found', '生徒のアカウントが見つかりません。');
   const password = genPassword();
   await getAuth().updateUser(uid, { password });
   await profile.update({ mustChangePassword: true });

@@ -2,7 +2,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import {
   getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut,
   updatePassword, EmailAuthProvider, reauthenticateWithCredential, setPersistence, inMemoryPersistence,
-  connectAuthEmulator,
+  connectAuthEmulator, sendPasswordResetEmail, sendEmailVerification, updateProfile,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, connectFirestoreEmulator, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc,
@@ -27,7 +27,7 @@ if (appConfig.functionsEnabled) {
   if (useEmu) connectFunctionsEmulator(fns, '127.0.0.1', 5001);
 }
 
-// 教師が生徒アカウントを作るとき、自分のログイン状態を保ったまま作成するための 2 つ目のアプリ
+// 先生が生徒アカウントを作るとき、自分のログイン状態を保ったまま作成するための 2 つ目のアプリ
 let secondary = null;
 async function secondaryAuth() {
   if (!secondary) {
@@ -41,7 +41,7 @@ async function secondaryAuth() {
 }
 
 // ---------------------------------------------------------------- helpers
-const S = { ready: false, user: null, profile: null, registering: false, cleanups: [] };
+const S = { ready: false, user: null, profile: null, busy: false, cleanups: [] };
 const $main = document.getElementById('app');
 document.title = appConfig.appName;
 document.getElementById('brand').textContent = appConfig.appName;
@@ -69,12 +69,17 @@ const fmt = (x) => (isNum(x) ? (Number.isInteger(x) ? String(x) : (Math.round(x 
 const f1 = (x) => (isNum(x) ? (Math.round(x * 10) / 10).toFixed(1) : '—');
 const pct = (x) => (isNum(x) ? f1(x * 100) + '%' : '—');
 const today = () => new Date().toLocaleDateString('sv-SE');
-const emailOf = (username) => `${username.toLowerCase()}@${appConfig.usernameDomain}`;
-const USERNAME_RE = /^[a-z0-9._-]{3,30}$/;
+// 生徒は「出席番号」から作った内部用のメールアドレスで Firebase Authentication にログインする
+const STUDENT_NO_RE = /^[0-9]{4}$/;
+const studentEmail = (no) => `s${no}@${appConfig.studentEmailDomain}`;
+const isStudentEmail = (email) => (email || '').toLowerCase().endsWith('@' + appConfig.studentEmailDomain);
+const normNo = (s) => (s || '').normalize('NFKC').trim();
+const normName = (s) => (s || '').normalize('NFKC').replace(/\s+/g, '');
 const rid = (p) => p + Math.random().toString(36).slice(2, 9);
 const heat = (rate) => (!isNum(rate) ? '' : rate < 0.5 ? 'heat-lo' : rate < 0.7 ? 'heat-mid' : 'heat-hi');
-const byClassNumber = (a, b) => (a.className || '').localeCompare(b.className || '', 'ja', { numeric: true })
-  || (a.number ?? 9999) - (b.number ?? 9999) || a.displayName.localeCompare(b.displayName, 'ja');
+const byNumber = (a, b) => (a.studentNo || a.email || '').localeCompare(b.studentNo || b.email || '') || a.displayName.localeCompare(b.displayName, 'ja');
+// 出席番号の先頭2桁（例: 3101 → 31）で絞り込むための候補
+const prefixesOf = (list) => [...new Set(list.filter((u) => u.role === 'student' && u.studentNo).map((u) => u.studentNo.slice(0, 2)))].sort();
 
 function genPassword() {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -85,8 +90,8 @@ function genPassword() {
 
 function errMsg(e) {
   const c = (e && e.code) || '';
-  if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-email', 'auth/invalid-login-credentials'].includes(c)) return 'ユーザー名またはパスワードが違います。';
-  if (c === 'auth/email-already-in-use') return 'このユーザー名はすでに使われています。別のユーザー名にしてください。';
+  if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-email', 'auth/invalid-login-credentials'].includes(c)) return 'ログイン情報が違います。';
+  if (c === 'auth/email-already-in-use') return 'すでに登録されています。';
   if (c === 'auth/weak-password') return 'パスワードは6文字以上にしてください。';
   if (c === 'auth/too-many-requests') return '試行回数が多すぎます。少し時間をおいてからお試しください。';
   if (c === 'auth/requires-recent-login') return 'もう一度ログインしてからお試しください。';
@@ -142,17 +147,23 @@ function renderNav() {
     link('#/', '得点表'),
     isTeacher() ? link('#/t/users', '生徒・アカウント') : null,
     link('#/account', 'パスワード変更'),
-    h('span', { class: 'who' }, `${S.profile.displayName}（${isTeacher() ? '教師' : '生徒'}）`),
+    h('span', { class: 'who' }, `${S.profile.displayName}（${isTeacher() ? '先生' : '生徒'}）`),
     h('button', { type: 'button', onclick: () => signOut(auth) }, 'ログアウト'),
   ].filter(Boolean));
 }
 
 async function route() {
   S.cleanups.splice(0).forEach((f) => { try { f(); } catch (e) { /* noop */ } });
-  if (!S.ready || S.registering) return;
+  if (!S.ready || S.busy) return;
   const parts = (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean);
-  if (!S.user) { renderNav(); return parts[0] === 'register' ? viewRegister() : viewLogin(); }
-  if (!S.profile) { renderNav(); return viewNoProfile(); }
+  if (!S.user) {
+    renderNav();
+    if (parts[0] === 'register') return viewStudentRegister();
+    if (parts[0] === 'teacher') return viewTeacherLogin();
+    if (parts[0] === 'teacher-register') return viewTeacherRegister();
+    return viewLogin();
+  }
+  if (!S.profile) { renderNav(); return isStudentEmail(S.user.email) ? viewNoProfile() : viewTeacherPending(); }
   renderNav();
   if (S.profile.mustChangePassword) return viewPassword(true);
   try {
@@ -175,8 +186,10 @@ window.addEventListener('hashchange', route);
 
 onAuthStateChanged(auth, async (user) => {
   S.user = user;
+  // ログイン・登録の処理中は、その処理の側でプロフィールを読み込んで画面を切り替える
+  if (S.busy) return;
   S.profile = null;
-  if (user && !S.registering) {
+  if (user) {
     try {
       const snap = await getDoc(doc(db, 'users', user.uid));
       S.profile = snap.exists() ? snap.data() : null;
@@ -187,92 +200,214 @@ onAuthStateChanged(auth, async (user) => {
 });
 
 // ---------------------------------------------------------------- auth views
-function viewLogin() {
-  const msg = h('p', { class: 'err', hidden: true });
-  const form = h('form', null,
-    h('div', { class: 'field' }, h('label', { class: 'label', for: 'li-user' }, 'ユーザー名'),
-      h('input', { type: 'text', id: 'li-user', autocomplete: 'username', autocapitalize: 'none', required: true })),
-    h('div', { class: 'field' }, h('label', { class: 'label', for: 'li-pass' }, 'パスワード'),
-      h('input', { type: 'password', id: 'li-pass', autocomplete: 'current-password', required: true })),
-    msg,
-    h('button', { class: 'btn primary', type: 'submit' }, 'ログイン'),
-  );
-  form.addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    msg.hidden = true;
-    const u = form.querySelector('#li-user').value.trim().toLowerCase();
-    const p = form.querySelector('#li-pass').value;
-    if (!USERNAME_RE.test(u)) { msg.textContent = 'ユーザー名またはパスワードが違います。'; msg.hidden = false; return; }
-    form.querySelector('button').disabled = true;
-    try { await signInWithEmailAndPassword(auth, emailOf(u), p); location.hash = '#/'; }
-    catch (e) { msg.textContent = errMsg(e); msg.hidden = false; }
-    finally { form.querySelector('button').disabled = false; }
-  });
-  mount(h('div', { class: 'auth card' },
-    h('h1', null, appConfig.appName),
-    h('p', { class: 'muted small' }, '問題演習の得点を記録して、得点率・平均点・順位を確認できます。'),
-    form,
-    h('p', { class: 'small' }, 'アカウントをお持ちでない方は ', h('a', { href: '#/register' }, '登録コードで新規登録'), '（登録コードは先生に確認してください）'),
-  ));
+let settingsCache = null;
+async function publicSettings() {
+  if (settingsCache) return settingsCache;
+  try {
+    const s = await getDoc(doc(db, 'config', 'settings'));
+    settingsCache = s.exists() ? s.data() : {};
+  } catch (e) { settingsCache = {}; }
+  return settingsCache;
 }
 
-function viewRegister() {
+const field = (id, label, input, hint) => h('div', { class: 'field' }, h('label', { class: 'label', for: id }, label), input, hint ? h('span', { class: 'small muted' }, hint) : null);
+const noInput = (id) => h('input', { type: 'text', id, inputmode: 'numeric', maxlength: 4, autocomplete: 'username', placeholder: '例: 3101', required: true, style: 'width:8em' });
+const authTabs = (active) => h('div', { class: 'tabs', role: 'tablist' },
+  h('a', { class: 'tab', href: '#/', role: 'tab', 'aria-selected': String(active === 'student') }, '生徒'),
+  h('a', { class: 'tab', href: '#/teacher', role: 'tab', 'aria-selected': String(active === 'teacher') }, '先生'));
+const authCard = (...children) => h('div', { class: 'auth card' }, h('h1', null, appConfig.appName), ...children);
+
+async function viewLogin() {
   const msg = h('p', { class: 'err', hidden: true });
-  const f = (id, label, input, hint) => h('div', { class: 'field' }, h('label', { class: 'label', for: id }, label), input, hint ? h('span', { class: 'small muted' }, hint) : null);
   const form = h('form', null,
-    f('rg-code', '登録コード', h('input', { type: 'text', id: 'rg-code', required: true, autocomplete: 'off' })),
-    f('rg-name', '名前', h('input', { type: 'text', id: 'rg-name', required: true, maxlength: 40, placeholder: '例: 山田 太郎' })),
-    h('div', { class: 'row' },
-      f('rg-class', '組', h('input', { type: 'text', id: 'rg-class', maxlength: 20, placeholder: '例: 3-1', style: 'width:7em' })),
-      f('rg-num', '番号', h('input', { type: 'number', id: 'rg-num', min: 1, max: 999, style: 'width:6em' }))),
-    f('rg-user', 'ユーザー名', h('input', { type: 'text', id: 'rg-user', required: true, autocapitalize: 'none', autocomplete: 'username' }), '半角英数字と . _ - で3〜30文字'),
-    f('rg-pass', 'パスワード', h('input', { type: 'password', id: 'rg-pass', required: true, minlength: 6, autocomplete: 'new-password' }), '6文字以上'),
-    f('rg-pass2', 'パスワード（確認）', h('input', { type: 'password', id: 'rg-pass2', required: true, autocomplete: 'new-password' })),
-    h('label', { class: 'row small' }, h('input', { type: 'checkbox', id: 'rg-teacher' }), '教師として登録する（教師用の登録コードが必要）'),
+    field('li-no', '出席番号（4桁）', noInput('li-no')),
+    field('li-name', '名前', h('input', { type: 'text', id: 'li-name', autocomplete: 'name', required: true, placeholder: '例: 山田 太郎' })),
+    field('li-pass', 'パスワード', h('input', { type: 'password', id: 'li-pass', autocomplete: 'current-password', required: true })),
     msg,
-    h('button', { class: 'btn primary', type: 'submit' }, '登録する'),
-  );
+    h('button', { class: 'btn primary', type: 'submit' }, 'ログイン'));
+  const signupNote = h('p', { class: 'small', hidden: true }, 'はじめて使う人は ', h('a', { href: '#/register' }, 'アカウントを作成'));
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
-    const v = (id) => form.querySelector('#' + id).value.trim();
-    const show = (t) => { msg.textContent = t; msg.hidden = false; };
     msg.hidden = true;
-    const username = v('rg-user').toLowerCase();
-    if (!USERNAME_RE.test(username)) return show('ユーザー名は半角英数字と . _ - で3〜30文字にしてください。');
-    if (form.querySelector('#rg-pass').value !== form.querySelector('#rg-pass2').value) return show('確認用のパスワードが一致しません。');
-    const num = v('rg-num') ? parseInt(v('rg-num'), 10) : null;
-    const profile = {
-      username, displayName: v('rg-name'), role: form.querySelector('#rg-teacher').checked ? 'teacher' : 'student',
-      className: v('rg-class'), number: Number.isInteger(num) ? num : null, mustChangePassword: false,
-      createdAt: Date.now(), joinCode: v('rg-code'),
-    };
-    form.querySelector('button[type=submit]').disabled = true;
-    S.registering = true;
-    let cred = null;
+    const no = normNo(form.querySelector('#li-no').value);
+    const name = form.querySelector('#li-name').value;
+    const fail = 'ログインできません。出席番号・名前・パスワードを確かめてください。';
+    if (!STUDENT_NO_RE.test(no)) { msg.textContent = '出席番号は4桁の数字で入力してください。'; msg.hidden = false; return; }
+    const btn = form.querySelector('button');
+    btn.disabled = true;
+    S.busy = true;
     try {
-      cred = await createUserWithEmailAndPassword(auth, emailOf(username), form.querySelector('#rg-pass').value);
-      try {
-        await setDoc(doc(db, 'users', cred.user.uid), profile);
-      } catch (e) {
-        await cred.user.delete().catch(() => {});
-        throw Object.assign(new Error('code'), { code: e.code === 'permission-denied' ? 'bad-code' : e.code });
+      const cred = await signInWithEmailAndPassword(auth, studentEmail(no), form.querySelector('#li-pass').value);
+      const snap = await getDoc(doc(db, 'users', cred.user.uid));
+      // 名前が登録内容と合わなければログインさせない（空白・全角半角の違いは無視）
+      if (!snap.exists() || normName(snap.data().displayName) !== normName(name)) {
+        await signOut(auth);
+        throw Object.assign(new Error(), { code: 'name-mismatch' });
       }
-      S.profile = profile;
-      S.registering = false;
+      S.user = cred.user;
+      S.profile = snap.data();
+      S.busy = false;
       location.hash = '#/';
       route();
     } catch (e) {
-      S.registering = false;
-      show(e.code === 'bad-code' ? '登録コードが違います。先生に確認してください。' : errMsg(e));
-    } finally {
-      form.querySelector('button[type=submit]').disabled = false;
-    }
+      S.busy = false;
+      msg.textContent = e.code === 'name-mismatch' || /^auth\/(invalid|wrong|user-not)/.test(e.code || '') ? fail : errMsg(e);
+      msg.hidden = false;
+    } finally { btn.disabled = false; }
   });
-  mount(h('div', { class: 'auth card' }, h('h1', null, '新規登録'), form, h('p', { class: 'small' }, h('a', { href: '#/' }, 'ログイン画面に戻る'))));
+  mount(authCard(authTabs('student'), form, signupNote));
+  if ((await publicSettings()).selfSignup) signupNote.hidden = false;
+}
+
+function viewTeacherLogin() {
+  const msg = h('p', { class: 'err', hidden: true });
+  const form = h('form', null,
+    field('tl-mail', 'メールアドレス', h('input', { type: 'email', id: 'tl-mail', autocomplete: 'email', required: true })),
+    field('tl-pass', 'パスワード', h('input', { type: 'password', id: 'tl-pass', autocomplete: 'current-password', required: true })),
+    msg,
+    h('button', { class: 'btn primary', type: 'submit' }, 'ログイン'));
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    msg.hidden = true;
+    const email = form.querySelector('#tl-mail').value.trim();
+    if (isStudentEmail(email)) { msg.textContent = 'メールアドレスまたはパスワードが違います。'; msg.hidden = false; return; }
+    try { await signInWithEmailAndPassword(auth, email, form.querySelector('#tl-pass').value); location.hash = '#/'; }
+    catch (e) { msg.textContent = /^auth\/(invalid|wrong|user-not)/.test(e.code || '') ? 'メールアドレスまたはパスワードが違います。' : errMsg(e); msg.hidden = false; }
+  });
+  const reset = h('button', {
+    class: 'btn link', type: 'button', onclick: async () => {
+      const email = form.querySelector('#tl-mail').value.trim();
+      if (!email) { msg.textContent = '上の欄にメールアドレスを入力してから押してください。'; msg.hidden = false; return; }
+      try { await sendPasswordResetEmail(auth, email); toast('パスワード再設定用のメールを送りました'); }
+      catch (e) { msg.textContent = errMsg(e); msg.hidden = false; }
+    },
+  }, 'パスワードを忘れた場合');
+  mount(authCard(authTabs('teacher'), form,
+    h('div', { class: 'row small' }, reset, h('span', { class: 'spacer' }), h('a', { href: '#/teacher-register' }, '先生の新規登録'))));
+}
+
+async function viewStudentRegister() {
+  if (!(await publicSettings()).selfSignup) {
+    return mount(authCard(h('h2', null, 'アカウントの作成'), h('p', null, '現在、自分でアカウントを作ることはできません。先生から配られた出席番号とパスワードでログインしてください。'), h('p', null, h('a', { href: '#/' }, 'ログイン画面に戻る'))));
+  }
+  const msg = h('p', { class: 'err', hidden: true });
+  const form = h('form', null,
+    field('rg-no', '出席番号（4桁）', noInput('rg-no')),
+    field('rg-name', '名前', h('input', { type: 'text', id: 'rg-name', required: true, maxlength: 40, placeholder: '例: 山田 太郎' }), 'ログインのときも同じ名前を入力します'),
+    field('rg-pass', 'パスワード', h('input', { type: 'password', id: 'rg-pass', required: true, minlength: 6, autocomplete: 'new-password' }), '6文字以上'),
+    field('rg-pass2', 'パスワード（確認）', h('input', { type: 'password', id: 'rg-pass2', required: true, autocomplete: 'new-password' })),
+    msg,
+    h('button', { class: 'btn primary', type: 'submit' }, 'アカウントを作成'));
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const show = (t) => { msg.textContent = t; msg.hidden = false; };
+    msg.hidden = true;
+    const no = normNo(form.querySelector('#rg-no').value);
+    const name = form.querySelector('#rg-name').value.trim();
+    if (!STUDENT_NO_RE.test(no)) return show('出席番号は4桁の数字で入力してください。');
+    if (!name) return show('名前を入力してください。');
+    if (form.querySelector('#rg-pass').value !== form.querySelector('#rg-pass2').value) return show('確認用のパスワードが一致しません。');
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    S.busy = true;
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, studentEmail(no), form.querySelector('#rg-pass').value);
+      const profile = { studentNo: no, displayName: name.slice(0, 40), role: 'student', mustChangePassword: false, createdAt: Date.now() };
+      try { await setDoc(doc(db, 'users', cred.user.uid), profile); }
+      catch (e) { await cred.user.delete().catch(() => {}); throw Object.assign(new Error(), { code: e.code === 'permission-denied' ? 'closed' : e.code }); }
+      S.user = cred.user;
+      S.profile = profile;
+      S.busy = false;
+      location.hash = '#/';
+      route();
+    } catch (e) {
+      S.busy = false;
+      show(e.code === 'auth/email-already-in-use' ? 'この出席番号はすでに登録されています。先生に確認してください。'
+        : e.code === 'closed' ? '現在、自分でアカウントを作ることはできません。先生に確認してください。' : errMsg(e));
+    } finally { btn.disabled = false; }
+  });
+  mount(authCard(h('h2', null, 'アカウントの作成'), form, h('p', { class: 'small' }, h('a', { href: '#/' }, 'ログイン画面に戻る'))));
+}
+
+function viewTeacherRegister() {
+  const msg = h('p', { class: 'err', hidden: true });
+  const form = h('form', null,
+    field('tr-name', '名前', h('input', { type: 'text', id: 'tr-name', required: true, maxlength: 40, placeholder: '例: 田中 一郎' })),
+    field('tr-mail', 'メールアドレス', h('input', { type: 'email', id: 'tr-mail', required: true, autocomplete: 'email' }), '先生として登録を許可されたメールアドレスだけが使えます'),
+    field('tr-pass', 'パスワード', h('input', { type: 'password', id: 'tr-pass', required: true, minlength: 8, autocomplete: 'new-password' }), '8文字以上'),
+    field('tr-pass2', 'パスワード（確認）', h('input', { type: 'password', id: 'tr-pass2', required: true, autocomplete: 'new-password' })),
+    msg,
+    h('button', { class: 'btn primary', type: 'submit' }, '登録して確認メールを送る'));
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const show = (t) => { msg.textContent = t; msg.hidden = false; };
+    msg.hidden = true;
+    const email = form.querySelector('#tr-mail').value.trim();
+    const name = form.querySelector('#tr-name').value.trim();
+    const pw = form.querySelector('#tr-pass').value;
+    if (isStudentEmail(email)) return show('このメールアドレスは使えません。');
+    if (pw.length < 8) return show('パスワードは8文字以上にしてください。');
+    if (pw !== form.querySelector('#tr-pass2').value) return show('確認用のパスワードが一致しません。');
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    S.busy = true;
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, pw);
+      await updateProfile(cred.user, { displayName: name.slice(0, 40) });
+      await sendEmailVerification(cred.user);
+      S.user = cred.user;
+      S.profile = null;
+    } catch (e) {
+      show(e.code === 'auth/email-already-in-use' ? 'このメールアドレスはすでに登録されています。「先生」タブからログインしてください。' : errMsg(e));
+    } finally {
+      S.busy = false;
+      btn.disabled = false;
+    }
+    if (S.user) { location.hash = '#/'; route(); }
+  });
+  mount(authCard(h('h2', null, '先生の新規登録'), form, h('p', { class: 'small' }, h('a', { href: '#/teacher' }, 'ログイン画面に戻る'))));
+}
+
+// 先生: メール確認 → 許可リストに載っていればプロフィールを作成
+async function viewTeacherPending() {
+  const u = S.user;
+  const out = h('p', { class: 'small' });
+  const logout = h('button', { class: 'btn', type: 'button', onclick: () => signOut(auth) }, 'ログアウト');
+  if (!u.emailVerified) {
+    const check = h('button', {
+      class: 'btn primary', type: 'button', onclick: async () => {
+        await u.reload();
+        if (!auth.currentUser.emailVerified) { out.className = 'small err'; out.textContent = 'まだ確認が済んでいません。メールのリンクを開いてから押してください。'; return; }
+        await auth.currentUser.getIdToken(true);
+        viewTeacherPending();
+      },
+    }, '確認しました');
+    const resend = h('button', {
+      class: 'btn', type: 'button', onclick: async () => {
+        try { await sendEmailVerification(u); out.className = 'small ok'; out.textContent = '確認メールを送り直しました。'; }
+        catch (e) { out.className = 'small err'; out.textContent = errMsg(e); }
+      },
+    }, '確認メールを再送');
+    return mount(authCard(h('h2', null, 'メールアドレスの確認'),
+      h('p', null, `${u.email} に確認メールを送りました。メールのリンクを開いてから「確認しました」を押してください。`),
+      h('p', { class: 'small muted' }, 'メールが見つからないときは、迷惑メールフォルダも確認してください。'),
+      h('div', { class: 'row' }, check, resend, logout), out));
+  }
+  const profile = { email: u.email.toLowerCase(), displayName: (u.displayName || u.email.split('@')[0]).slice(0, 40), role: 'teacher', mustChangePassword: false, createdAt: Date.now() };
+  try {
+    await setDoc(doc(db, 'users', u.uid), profile);
+    S.profile = profile;
+    route();
+  } catch (e) {
+    mount(authCard(h('h2', null, '先生としての登録が許可されていません'),
+      h('p', null, `${u.email} は、先生として登録できるメールアドレスの一覧にありません。`),
+      h('p', { class: 'small muted' }, 'すでに登録している先生に「生徒・アカウント」画面の「先生として登録できるメールアドレス」へ追加してもらい、もう一度ログインしてください。最初の先生の場合は、README の手順で Firebase コンソールから追加します。'),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'button', onclick: () => viewTeacherPending() }, 'もう一度確認する'), logout)));
+  }
 }
 
 function viewNoProfile() {
-  mount(h('div', { class: 'auth card' },
+  mount(authCard(
     h('h2', null, 'アカウント情報が見つかりません'),
     h('p', null, 'このアカウントは削除されたか、登録が完了していません。先生に確認してください。'),
     h('button', { class: 'btn', onclick: () => signOut(auth) }, 'ログアウト')));
@@ -281,13 +416,12 @@ function viewNoProfile() {
 function viewPassword(forced) {
   const msg = h('p', { class: 'err', hidden: true });
   const form = h('form', { class: 'stack' },
-    h('div', { class: 'field' }, h('label', { class: 'label', for: 'pw-cur' }, forced ? '先生から受け取ったパスワード' : '今のパスワード'), h('input', { type: 'password', id: 'pw-cur', required: true, autocomplete: 'current-password' })),
-    h('div', { class: 'field' }, h('label', { class: 'label', for: 'pw-new' }, '新しいパスワード（6文字以上）'), h('input', { type: 'password', id: 'pw-new', required: true, minlength: 6, autocomplete: 'new-password' })),
-    h('div', { class: 'field' }, h('label', { class: 'label', for: 'pw-new2' }, '新しいパスワード（確認）'), h('input', { type: 'password', id: 'pw-new2', required: true, autocomplete: 'new-password' })),
+    field('pw-cur', forced ? '先生から受け取ったパスワード' : '今のパスワード', h('input', { type: 'password', id: 'pw-cur', required: true, autocomplete: 'current-password' })),
+    field('pw-new', '新しいパスワード（6文字以上）', h('input', { type: 'password', id: 'pw-new', required: true, minlength: 6, autocomplete: 'new-password' })),
+    field('pw-new2', '新しいパスワード（確認）', h('input', { type: 'password', id: 'pw-new2', required: true, autocomplete: 'new-password' })),
     msg,
     h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'submit' }, 'パスワードを変更'),
-      forced ? h('button', { class: 'btn', type: 'button', onclick: () => signOut(auth) }, 'ログアウト') : null),
-  );
+      forced ? h('button', { class: 'btn', type: 'button', onclick: () => signOut(auth) }, 'ログアウト') : null));
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     msg.hidden = true;
@@ -304,12 +438,12 @@ function viewPassword(forced) {
       toast('パスワードを変更しました');
       location.hash = '#/';
       route();
-    } catch (e) { msg.textContent = errMsg(e); msg.hidden = false; }
+    } catch (e) { msg.textContent = /^auth\/(invalid|wrong)/.test(e.code || '') ? '今のパスワードが違います。' : errMsg(e); msg.hidden = false; }
   });
   mount(h('div', { class: 'auth card' },
     h('h1', null, forced ? '最初にパスワードを変更してください' : 'パスワード変更'),
     forced ? h('p', { class: 'small muted' }, '先生から受け取った仮のパスワードを、自分だけが知っているパスワードに変えます。') : null,
-    h('p', { class: 'small muted' }, `ユーザー名: ${S.profile.username}`),
+    h('p', { class: 'small muted' }, S.profile.role === 'student' ? `出席番号 ${S.profile.studentNo}　${S.profile.displayName}` : S.profile.email),
     form));
 }
 
@@ -354,14 +488,14 @@ async function viewStudentHome() {
       h('td', { class: `r num ${heat(r.g.rate)}` }, pct(r.g.rate))))))) : null;
 
   mount(
-    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, `${S.profile.className ? S.profile.className + '組 ' : ''}${S.profile.number ? S.profile.number + '番 ' : ''}${S.profile.displayName}`), h('h1', null, '自分の得点表'))),
+    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, `出席番号 ${S.profile.studentNo}　${S.profile.displayName}`), h('h1', null, '自分の得点表'))),
     wbs.length ? h('div', { class: 'wb-list' }, cards)
       : h('div', { class: 'card' }, h('h2', null, 'まだ得点表がありません'), h('p', { class: 'muted' }, '先生が得点表を公開すると、ここに表示されます。')),
     recentTable ? h('section', { class: 'stack' }, h('h2', null, '最近の記録'), recentTable) : null,
   );
 }
 
-// ---------------------------------------------------------------- 得点表（生徒の記入画面・教師の閲覧画面）
+// ---------------------------------------------------------------- 得点表（生徒の記入画面・先生の閲覧画面）
 async function viewSheet(wbId, uid, teacherMode) {
   const wbSnap = await getDoc(doc(db, 'workbooks', wbId));
   if (!wbSnap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
@@ -623,7 +757,7 @@ async function viewSheet(wbId, uid, teacherMode) {
   }, (e) => setSave('error', '集計を読み込めませんでした: ' + errMsg(e)));
   S.cleanups.push(unsub);
 
-  const nameLine = `${student.className ? student.className + '組 ' : ''}${student.number ? student.number + '番 ' : ''}${student.displayName}`;
+  const nameLine = `${student.studentNo ? '出席番号 ' + student.studentNo + '　' : ''}${student.displayName}`;
   mount(
     h('div', { class: 'page-head' },
       h('div', null,
@@ -677,7 +811,7 @@ async function viewTeacherHome() {
   });
 
   mount(
-    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '教師用'), h('h1', null, '得点表の管理'))),
+    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '先生用'), h('h1', null, '得点表の管理'))),
     h('div', { class: 'card' },
       h('h2', null, '新しい得点表を作る'),
       h('p', { class: 'small muted' }, '教材やテストごとに1つ作ります。作成後に、セット・回・問題（番号・分野・配点）を設定します。'),
@@ -874,13 +1008,12 @@ async function viewResults(wbId) {
     getDocs(query(collection(db, 'users'), where('role', '==', 'student'))),
     getDocs(query(collection(db, 'notes'), where('wbId', '==', wbId))),
   ]);
-  const students = uSnap.docs.map((d) => ({ uid: d.id, ...d.data() })).sort(byClassNumber);
+  const students = uSnap.docs.map((d) => ({ uid: d.id, ...d.data() })).sort(byNumber);
   const notes = Object.fromEntries(nSnap.docs.map((d) => [d.data().uid, d.data()]));
   let records = {};
   const st = { mode: 'rounds', cls: '', sort: 'number' };
 
-  const classes = [...new Set(students.map((s) => s.className).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja', { numeric: true }));
-  const clsSel = h('select', { 'aria-label': '組' }, h('option', { value: '' }, 'すべての組'), classes.map((c) => h('option', { value: c }, `${c}組`)));
+  const clsSel = h('select', { 'aria-label': '出席番号で絞り込み' }, h('option', { value: '' }, 'すべての生徒'), prefixesOf(students).map((p) => h('option', { value: p }, `出席番号 ${p}xx`)));
   clsSel.onchange = () => { st.cls = clsSel.value; render(); };
   const sortSel = h('select', { 'aria-label': '並び順' }, h('option', { value: 'number' }, '出席番号順'), h('option', { value: 'rate' }, '得点率の高い順'));
   sortSel.onchange = () => { st.sort = sortSel.value; render(); };
@@ -901,7 +1034,7 @@ async function viewResults(wbId) {
 
   function render() {
     const cols = columns();
-    const rows = students.filter((s) => !st.cls || s.className === st.cls).map((s) => {
+    const rows = students.filter((s) => !st.cls || (s.studentNo || '').startsWith(st.cls)).map((s) => {
       const scores = (records[s.uid] || {}).scores || {};
       const overall = evalGroup(idx.all, scores);
       let done = 0;
@@ -933,17 +1066,17 @@ async function viewResults(wbId) {
 
     tableBox.replaceChildren(h('table', null,
       h('thead', null, h('tr', null,
-        h('th', { class: 'sticky' }, '名前'), h('th', null, '組'), h('th', { class: 'r' }, '番号'),
+        h('th', { class: 'r' }, '出席番号'), h('th', { class: 'sticky' }, '名前'),
         cols.map((c) => h('th', { class: 'r' }, c.label, h('br'), h('span', null, c.kind === 'rate' ? `満点${fmt(maxOf(c))}` : `/${fmt(maxOf(c))}`))),
         h('th', { class: 'r' }, '記入済み'), h('th', { class: 'r' }, '得点率'), h('th', { class: 'r' }, '順位'), h('th', { class: 'r' }, '最終目標'), h('th', null, '最終更新'))),
       h('tbody', null,
         h('tr', { class: 'avg-row' },
-          h('td', { class: 'sticky' }, '平均'), h('td'), h('td'),
+          h('td'), h('td', { class: 'sticky' }, '平均'),
           cols.map((c, i) => h('td', { class: 'r num' }, colAvg[i].n ? (c.kind === 'rate' ? pct(colAvg[i].avg) : f1(colAvg[i].avg)) : '—')),
           h('td'), h('td', { class: 'r num' }, pct(ov.avg)), h('td'), h('td'), h('td')),
         rows.map((r) => h('tr', null,
+          h('td', { class: 'r num' }, r.s.studentNo || ''),
           h('td', { class: 'sticky' }, h('a', { href: `#/t/wb/${wbId}/u/${r.s.uid}` }, r.s.displayName)),
-          h('td', null, r.s.className || ''), h('td', { class: 'r num' }, r.s.number ?? ''),
           cols.map((c, i) => cellFor(c, r.cells[i], r)),
           h('td', { class: 'r num' }, `${r.done}/${idx.rounds.size}`),
           h('td', { class: `r num ${heat(r.overall.rate)}` }, pct(r.overall.rate)),
@@ -953,17 +1086,17 @@ async function viewResults(wbId) {
   }
 
   function exportCsv() {
-    const head = ['組', '番号', '名前', 'ユーザー名'];
+    const head = ['出席番号', '名前'];
     for (const it of idx.all) head.push(`${it.roundLabel} ${it.label} ${(wb.fields || []).find((f) => f.id === it.fieldId)?.name || ''} (/${it.max})`.replace(/\s+/g, ' '));
     for (const [, items] of idx.rounds) head.push(`${items[0]?.roundLabel || ''} 小計 (/${evalGroup(items, {}).max})`);
     for (const s of wb.sets || []) head.push(`${s.label} 合計 (/${evalGroup(idx.sets.get(s.id), {}).max})`, `${s.label} 目標`);
     for (const f of wb.fields || []) head.push(`${f.name} 得点率(%)`);
     head.push('全体 得点率(%)', '最終目標');
     const lines = [head];
-    for (const s of students.filter((x) => !st.cls || x.className === st.cls)) {
+    for (const s of students.filter((x) => !st.cls || (x.studentNo || '').startsWith(st.cls))) {
       const scores = (records[s.uid] || {}).scores || {};
       const note = notes[s.uid] || {};
-      const row = [s.className || '', s.number ?? '', s.displayName, s.username];
+      const row = [s.studentNo || '', s.displayName];
       for (const it of idx.all) { const v = validScore(it, scores); row.push(v === null ? '' : v); }
       for (const [, items] of idx.rounds) { const g = evalGroup(items, scores); row.push(g.complete ? g.sum : ''); }
       for (const set of wb.sets || []) { const g = evalGroup(idx.sets.get(set.id), scores); row.push(g.complete ? g.sum : '', (note.entries || {})[set.id]?.target ?? ''); }
@@ -995,43 +1128,32 @@ async function viewResults(wbId) {
 
 // ---------------------------------------------------------------- teacher: users
 async function viewUsers() {
-  const [uSnap, secSnap] = await Promise.all([getDocs(collection(db, 'users')), getDoc(doc(db, 'config', 'secret')).catch(() => null)]);
-  let users = uSnap.docs.map((d) => ({ uid: d.id, ...d.data() })).sort((a, b) => (a.role === b.role ? 0 : a.role === 'teacher' ? -1 : 1) || byClassNumber(a, b));
-  const secret = secSnap && secSnap.exists() ? secSnap.data() : {};
+  const [uSnap, tSnap, setSnap] = await Promise.all([
+    getDocs(collection(db, 'users')),
+    getDoc(doc(db, 'config', 'teachers')).catch(() => null),
+    getDoc(doc(db, 'config', 'settings')).catch(() => null),
+  ]);
+  const sortUsers = (list) => list.sort((a, b) => (a.role === b.role ? 0 : a.role === 'teacher' ? -1 : 1) || byNumber(a, b));
+  let users = sortUsers(uSnap.docs.map((d) => ({ uid: d.id, ...d.data() })));
+  let teacherEmails = (tSnap && tSnap.exists() && Array.isArray(tSnap.data().emails)) ? [...tSnap.data().emails] : [];
+  const settings = setSnap && setSnap.exists() ? setSnap.data() : {};
 
-  // 登録コード
-  const sc = h('input', { type: 'text', value: secret.studentCode || '', id: 'code-s', maxlength: 40, autocomplete: 'off' });
-  const tc = h('input', { type: 'text', value: secret.teacherCode || '', id: 'code-t', maxlength: 40, autocomplete: 'off' });
-  const codeMsg = h('span', { class: 'small' });
-  const codeCard = h('div', { class: 'card' },
-    h('h2', null, '登録コード'),
-    h('p', { class: 'small muted' }, '生徒が自分でアカウントを作るときに入力するコードです。空欄にすると、その種類の自己登録はできなくなります。'),
-    h('div', { class: 'row' },
-      h('div', { class: 'field' }, h('label', { class: 'label', for: 'code-s' }, '生徒用'), sc),
-      h('div', { class: 'field' }, h('label', { class: 'label', for: 'code-t' }, '教師用'), tc),
-      h('button', {
-        class: 'btn', type: 'button', style: 'align-self:flex-end', onclick: async () => {
-          try { await setDoc(doc(db, 'config', 'secret'), { studentCode: sc.value.trim(), teacherCode: tc.value.trim() }); codeMsg.className = 'small ok'; codeMsg.textContent = '保存しました'; }
-          catch (e) { codeMsg.className = 'small err'; codeMsg.textContent = errMsg(e); }
-        },
-      }, '保存'), codeMsg));
-
-  // 一括作成
-  const bulk = h('textarea', { rows: 6, id: 'bulk', placeholder: '3-1,1,山田 太郎,yamada.taro\n3-1,2,佐藤 花子,sato.hanako' });
-  const roleSel = h('select', { id: 'bulk-role' }, h('option', { value: 'student' }, '生徒として作成'), h('option', { value: 'teacher' }, '教師として作成'));
+  // ---- 生徒アカウントの一括作成
+  const bulk = h('textarea', { rows: 6, id: 'bulk', placeholder: '3101,山田 太郎\n3102,佐藤 花子' });
   const bulkMsg = h('div', { class: 'small' });
   const bulkResult = h('div');
   const bulkBtn = h('button', { class: 'btn primary', type: 'button' }, 'アカウントを作成');
   bulkBtn.onclick = async () => {
     const lines = bulk.value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const rows = [], problems = [];
+    const rows = [], problems = [], seen = new Set();
     lines.forEach((l, i) => {
-      const [cls = '', num = '', name = '', user = ''] = l.split(/[,\t、，]/).map((x) => x.trim());
-      const username = user.toLowerCase();
-      if (!name || !USERNAME_RE.test(username)) problems.push(`${i + 1}行目: 名前とユーザー名（半角英数字と . _ - で3〜30文字）を確認してください`);
-      else rows.push({ className: cls, number: num && Number.isInteger(Number(num)) ? Number(num) : null, displayName: name.slice(0, 40), username });
+      const [no = '', ...rest] = l.split(/[,\t、，]/).map((x) => x.trim());
+      const studentNo = normNo(no), name = rest.join(' ').trim();
+      if (!STUDENT_NO_RE.test(studentNo) || !name) problems.push(`${i + 1}行目: 「出席番号（4桁）,名前」の形にしてください`);
+      else if (seen.has(studentNo)) problems.push(`${i + 1}行目: 出席番号 ${studentNo} が重複しています`);
+      else { seen.add(studentNo); rows.push({ studentNo, displayName: name.slice(0, 40) }); }
     });
-    if (!rows.length || problems.length) { bulkMsg.className = 'small err'; bulkMsg.textContent = problems.join(' / ') || '1行に「組,番号,名前,ユーザー名」の形で入力してください。'; return; }
+    if (!rows.length || problems.length) { bulkMsg.className = 'small err'; bulkMsg.textContent = problems.join(' / ') || '1行に「出席番号,名前」の形で入力してください。'; return; }
     bulkBtn.disabled = true;
     bulkMsg.className = 'small muted';
     const a2 = await secondaryAuth();
@@ -1040,69 +1162,72 @@ async function viewUsers() {
       bulkMsg.textContent = `作成中… ${i + 1} / ${rows.length}`;
       const password = genPassword();
       try {
-        const cred = await createUserWithEmailAndPassword(a2, emailOf(r.username), password);
+        const cred = await createUserWithEmailAndPassword(a2, studentEmail(r.studentNo), password);
         try {
-          await setDoc(doc(db, 'users', cred.user.uid), { ...r, role: roleSel.value, mustChangePassword: true, createdAt: Date.now() });
+          await setDoc(doc(db, 'users', cred.user.uid), { ...r, role: 'student', mustChangePassword: true, createdAt: Date.now() });
         } catch (e) { await cred.user.delete().catch(() => {}); throw e; }
         results.push({ ...r, password, ok: true });
-      } catch (e) { results.push({ ...r, ok: false, error: errMsg(e) }); }
-      finally { await signOut(a2).catch(() => {}); }
+      } catch (e) {
+        results.push({ ...r, ok: false, error: e.code === 'auth/email-already-in-use' ? 'この出席番号はすでに登録されています' : errMsg(e) });
+      } finally { await signOut(a2).catch(() => {}); }
     }
     bulkBtn.disabled = false;
     const okRows = results.filter((r) => r.ok);
     bulkMsg.className = 'small ' + (okRows.length === results.length ? 'ok' : 'err');
     bulkMsg.textContent = `${okRows.length}件作成しました` + (okRows.length < results.length ? `（${results.length - okRows.length}件は失敗）` : '') + '。初期パスワードはこの画面を離れると再表示できません。控えてから生徒に配ってください。';
-    const tsv = ['組\t番号\t名前\tユーザー名\t初期パスワード', ...okRows.map((r) => [r.className, r.number ?? '', r.displayName, r.username, r.password].join('\t'))].join('\n');
+    const tsv = ['出席番号\t名前\t初期パスワード', ...okRows.map((r) => [r.studentNo, r.displayName, r.password].join('\t'))].join('\n');
     bulkResult.replaceChildren(
       h('div', { class: 'row' },
         h('button', { class: 'btn small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(tsv); toast('コピーしました（表計算ソフトに貼り付けられます）'); } catch (e) { toast('コピーできませんでした'); } } }, '一覧をコピー'),
         h('button', { class: 'btn small', type: 'button', onclick: () => downloadText(`初期パスワード_${today()}.csv`, tsv.replace(/\t/g, ',')) }, 'CSVで保存')),
       h('div', { class: 'tscroll' }, h('table', { class: 'pw-list' },
-        h('thead', null, h('tr', null, h('th', null, '組'), h('th', null, '番号'), h('th', null, '名前'), h('th', null, 'ユーザー名'), h('th', null, '初期パスワード / 結果'))),
-        h('tbody', null, results.map((r) => h('tr', null, h('td', null, r.className), h('td', null, r.number ?? ''), h('td', null, r.displayName), h('td', null, r.username),
+        h('thead', null, h('tr', null, h('th', null, '出席番号'), h('th', null, '名前'), h('th', null, '初期パスワード / 結果'))),
+        h('tbody', null, results.map((r) => h('tr', null, h('td', null, r.studentNo), h('td', null, r.displayName),
           h('td', { class: r.ok ? '' : 'err' }, r.ok ? r.password : r.error)))))));
     if (okRows.length) { bulk.value = ''; await refreshList(); }
   };
   const bulkCard = h('div', { class: 'card' },
-    h('h2', null, 'アカウントをまとめて作成'),
-    h('p', { class: 'small muted' }, '1行に1人、「組,番号,名前,ユーザー名」の順でカンマ区切りで入力します（表計算ソフトからの貼り付けも可）。初期パスワードは自動で作られ、生徒は最初のログイン時に自分のパスワードへ変更します。'),
-    bulk, h('div', { class: 'row' }, roleSel, bulkBtn), bulkMsg, bulkResult);
+    h('h2', null, '生徒アカウントをまとめて作成'),
+    h('p', { class: 'small muted' }, '1行に1人、「出席番号（4桁）,名前」の順で入力します（表計算ソフトからの貼り付けも可）。初期パスワードは自動で作られます。生徒は「出席番号・名前・パスワード」でログインし、最初に自分のパスワードへ変更します。'),
+    bulk, h('div', { class: 'row' }, bulkBtn), bulkMsg, bulkResult);
 
-  // 一覧
+  // ---- アカウント一覧
   const listBox = h('div', { class: 'tscroll' });
-  const filterSel = h('select', { 'aria-label': '組で絞り込み' });
+  const filterSel = h('select', { 'aria-label': '出席番号で絞り込み' });
   filterSel.onchange = () => renderList();
   async function refreshList() {
     const s = await getDocs(collection(db, 'users'));
-    users = s.docs.map((d) => ({ uid: d.id, ...d.data() })).sort((a, b) => (a.role === b.role ? 0 : a.role === 'teacher' ? -1 : 1) || byClassNumber(a, b));
+    users = sortUsers(s.docs.map((d) => ({ uid: d.id, ...d.data() })));
     renderList();
   }
   const call = (name) => httpsCallable(fns, name);
 
   function renderList() {
-    const classes = [...new Set(users.map((u) => u.className).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja', { numeric: true }));
     const cur = filterSel.value;
-    filterSel.replaceChildren(h('option', { value: '' }, 'すべて'), classes.map((c) => h('option', { value: c, selected: c === cur }, `${c}組`)));
-    const shown = users.filter((u) => !filterSel.value || u.className === filterSel.value);
+    filterSel.replaceChildren(h('option', { value: '' }, 'すべて'), h('option', { value: 'teacher', selected: cur === 'teacher' }, '先生のみ'),
+      prefixesOf(users).map((p) => h('option', { value: p, selected: p === cur }, `${p}xx`)));
+    const f = filterSel.value;
+    const shown = users.filter((u) => !f || (f === 'teacher' ? u.role === 'teacher' : u.role === 'student' && (u.studentNo || '').startsWith(f)));
     listBox.replaceChildren(h('table', null,
-      h('thead', null, h('tr', null, h('th', null, '組'), h('th', { class: 'r' }, '番号'), h('th', null, '名前'), h('th', null, 'ユーザー名'), h('th', null, '役割'), h('th', null, 'パスワード'), h('th', null, '操作'))),
+      h('thead', null, h('tr', null, h('th', null, '出席番号 / メール'), h('th', null, '名前'), h('th', null, '役割'), h('th', null, 'パスワード'), h('th', null, '操作'))),
       h('tbody', null, shown.map((u) => userRow(u)))));
   }
 
   function userRow(u) {
     const tr = h('tr');
-    const pwCell = h('td', null, u.mustChangePassword ? h('span', { class: 'pill warn' }, '初期パスワードのまま') : h('span', { class: 'pill muted' }, '変更済み'));
-    const actions = h('td', { class: 'row', style: 'flex-wrap:nowrap' });
     const isMe = u.uid === S.user.uid;
-    actions.append(h('button', { class: 'btn small', type: 'button', onclick: () => editRow() }, '編集'));
-    if (fns) {
+    const student = u.role === 'student';
+    const pwCell = h('td', null, !student ? h('span', { class: 'small muted' }, 'メールで再設定') : u.mustChangePassword ? h('span', { class: 'pill warn' }, '初期パスワードのまま') : h('span', { class: 'pill muted' }, '変更済み'));
+    const actions = h('td', { class: 'row', style: 'flex-wrap:nowrap' });
+    actions.append(h('button', { class: 'btn small', type: 'button', onclick: () => editRow() }, '名前を編集'));
+    if (fns && student) {
       actions.append(confirmButton('パスワード再発行', 'もう一度押すと再発行', async () => {
         try { const r = await call('resetPassword')({ uid: u.uid }); u.mustChangePassword = true; pwCell.replaceChildren(h('span', { class: 'num' }, `新しいパスワード: ${r.data.password}`)); }
         catch (e) { toast(errMsg(e)); }
       }, 'btn small'));
     }
     if (!isMe) {
-      actions.append(confirmButton('削除', 'もう一度押すと記録ごと削除', async () => {
+      actions.append(confirmButton('削除', student ? 'もう一度押すと記録ごと削除' : 'もう一度押すと削除', async () => {
         try {
           if (fns) await call('deleteAccount')({ uid: u.uid });
           for (const col of ['scores', 'notes']) {
@@ -1112,39 +1237,77 @@ async function viewUsers() {
           await deleteDoc(doc(db, 'users', u.uid));
           users = users.filter((x) => x.uid !== u.uid);
           renderList();
-          toast(fns ? '削除しました' : '削除しました（ログイン情報はFirebaseコンソールから削除してください）');
+          toast(fns ? '削除しました' : '削除しました（ログイン情報は Firebase コンソールの Authentication から削除してください）');
         } catch (e) { toast(errMsg(e)); }
       }));
     }
-    tr.append(h('td', null, u.className || ''), h('td', { class: 'r num' }, u.number ?? ''), h('td', null, u.displayName), h('td', { class: 'num' }, u.username),
-      h('td', null, u.role === 'teacher' ? h('span', { class: 'pill accent' }, '教師') : '生徒'), pwCell, actions);
+    tr.append(h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, u.displayName),
+      h('td', null, student ? '生徒' : h('span', { class: 'pill accent' }, '先生')), pwCell, actions);
 
     function editRow() {
-      const c = h('input', { type: 'text', value: u.className || '', style: 'width:5em', maxlength: 20, 'aria-label': '組' });
-      const n = h('input', { type: 'number', value: u.number ?? '', style: 'width:5em', 'aria-label': '番号' });
       const nm = h('input', { type: 'text', value: u.displayName, maxlength: 40, 'aria-label': '名前' });
-      const rl = h('select', { 'aria-label': '役割', disabled: isMe }, h('option', { value: 'student', selected: u.role === 'student' }, '生徒'), h('option', { value: 'teacher', selected: u.role === 'teacher' }, '教師'));
       const save = h('button', {
         class: 'btn small primary', type: 'button', onclick: async () => {
-          const num = n.value === '' ? null : parseInt(n.value, 10);
-          const next = { ...u, className: c.value.trim(), number: Number.isInteger(num) ? num : null, displayName: nm.value.trim() || u.displayName, role: rl.value };
-          const { uid, ...data } = next;
-          try { await setDoc(doc(db, 'users', uid), data); Object.assign(u, next); renderList(); toast('保存しました'); }
+          const name = nm.value.trim();
+          if (!name) return;
+          try { await updateDoc(doc(db, 'users', u.uid), { displayName: name }); u.displayName = name; renderList(); toast('保存しました'); }
           catch (e) { toast(errMsg(e)); }
         },
       }, '保存');
-      tr.replaceChildren(h('td', null, c), h('td', null, n), h('td', null, nm), h('td', { class: 'num' }, u.username), h('td', null, rl), h('td'),
+      tr.replaceChildren(h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, nm), h('td'), h('td'),
         h('td', { class: 'row', style: 'flex-wrap:nowrap' }, save, h('button', { class: 'btn small', type: 'button', onclick: () => renderList() }, 'やめる')));
     }
     return tr;
   }
 
+  // ---- 先生として登録できるメールアドレス
+  const tBox = h('div', { class: 'stack', style: 'gap:6px' });
+  const tIn = h('input', { type: 'email', id: 't-mail', placeholder: 'sensei@example.ed.jp', style: 'flex:1;min-width:14em' });
+  const tMsg = h('span', { class: 'small' });
+  async function saveEmails(next) {
+    try { await setDoc(doc(db, 'config', 'teachers'), { emails: next }); teacherEmails = next; renderEmails(); tMsg.className = 'small ok'; tMsg.textContent = '保存しました'; }
+    catch (e) { tMsg.className = 'small err'; tMsg.textContent = errMsg(e); }
+  }
+  function renderEmails() {
+    tBox.replaceChildren(...teacherEmails.map((m) => h('div', { class: 'row' },
+      h('span', { class: 'num' }, m),
+      users.some((u) => u.email === m) ? h('span', { class: 'pill good' }, '登録済み') : h('span', { class: 'pill muted' }, '未登録'),
+      m === S.profile.email ? null : h('button', { class: 'btn small danger', type: 'button', onclick: () => saveEmails(teacherEmails.filter((x) => x !== m)) }, '一覧から外す'))));
+  }
+  const tAdd = h('button', {
+    class: 'btn', type: 'button', onclick: () => {
+      const m = tIn.value.trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(m)) { tMsg.className = 'small err'; tMsg.textContent = 'メールアドレスの形を確認してください。'; return; }
+      if (teacherEmails.includes(m)) { tMsg.className = 'small muted'; tMsg.textContent = 'すでに一覧にあります。'; return; }
+      tIn.value = '';
+      saveEmails([...teacherEmails, m]);
+    },
+  }, '追加');
+  const teacherCard = h('div', { class: 'card' },
+    h('h2', null, '先生として登録できるメールアドレス'),
+    h('p', { class: 'small muted' }, 'ここに追加したメールアドレスの人だけが、「先生の新規登録」から先生として登録できます（メールの確認が必要です）。一覧から外しても、すでに登録済みのアカウントは残るので、不要なら上の一覧から削除してください。'),
+    tBox, h('div', { class: 'row' }, tIn, tAdd, tMsg));
+
+  // ---- 生徒の自己登録
+  const selfChk = h('input', { type: 'checkbox', id: 'self-signup', checked: !!settings.selfSignup });
+  const selfMsg = h('span', { class: 'small' });
+  selfChk.onchange = async () => {
+    try { await setDoc(doc(db, 'config', 'settings'), { selfSignup: selfChk.checked }); settingsCache = null; selfMsg.className = 'small ok'; selfMsg.textContent = selfChk.checked ? '受け付けを始めました' : '受け付けを止めました'; }
+    catch (e) { selfChk.checked = !selfChk.checked; selfMsg.className = 'small err'; selfMsg.textContent = errMsg(e); }
+  };
+  const selfCard = h('div', { class: 'card' },
+    h('h2', null, '生徒の自己登録'),
+    h('label', { class: 'row' }, selfChk, '生徒が自分でアカウントを作れるようにする', selfMsg),
+    h('p', { class: 'small muted' }, 'オンの間は、ログイン画面に「アカウントを作成」が表示され、生徒が出席番号・名前・パスワードを決めて登録できます。出席番号を知っていれば誰でも登録できてしまうため、全員の登録が終わったらオフにしてください。'));
+
   mount(
-    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '教師用'), h('h1', null, '生徒・アカウント'))),
-    !fns ? h('p', { class: 'notice small' }, 'パスワードを忘れた生徒がいる場合: Cloud Functions を有効にすると、この画面から再発行できます（README参照）。有効にしていない場合は、Firebase コンソールの Authentication でそのユーザーを削除し、ここで同じユーザー名のアカウントを作り直してください（記録は引き継がれません）。') : null,
+    h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '先生用'), h('h1', null, '生徒・アカウント'))),
+    !fns ? h('p', { class: 'notice small' }, '生徒がパスワードを忘れた場合: Cloud Functions を有効にすると、この画面から再発行できます（README参照）。有効にしていない場合は、Firebase コンソールの Authentication でその生徒を削除し、ここで同じ出席番号のアカウントを作り直してください（記録は引き継がれません）。') : null,
     bulkCard,
-    h('section', { class: 'stack' }, h('div', { class: 'row' }, h('h2', null, 'アカウント一覧'), h('span', { class: 'spacer' }), h('span', { class: 'label' }, '組'), filterSel), listBox),
-    codeCard,
+    h('section', { class: 'stack' }, h('div', { class: 'row' }, h('h2', null, 'アカウント一覧'), h('span', { class: 'spacer' }), h('span', { class: 'label' }, '絞り込み'), filterSel), listBox),
+    teacherCard,
+    selfCard,
   );
   renderList();
+  renderEmails();
 }

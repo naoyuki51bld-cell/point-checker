@@ -13,11 +13,11 @@ export const firebaseConfig = {
 export const appConfig = {
   // アプリの表示名
   appName: 'デジタル得点表',
-  // ユーザー名を Firebase Authentication 用のメールアドレス形式に変換するためのドメイン。
-  // 実在しなくてよい。firestore.rules の usernameDomain() と必ず同じ値にする。
-  usernameDomain: 'score-note.local',
+  // 生徒の出席番号を Firebase Authentication 用のメールアドレス形式（s3101@このドメイン）に変換するためのドメイン。
+  // 実在しなくてよい。firestore.rules の studentEmailDomain() と必ず同じ値にする。
+  studentEmailDomain: 'score-note.local',
   // Cloud Functions（functions/）をデプロイした場合は true に。
-  // 教師画面から「パスワード再発行」「ログインアカウントの完全削除」ができるようになります（Blaze プランが必要）。
+  // 先生の画面から「パスワード再発行」「ログインアカウントの完全削除」ができるようになります（Blaze プランが必要）。
   functionsEnabled: false,
   functionsRegion: 'asia-northeast1',
   // ローカルの Firebase エミュレーターで動かすとき（localhost で開いたとき）に自動で接続する

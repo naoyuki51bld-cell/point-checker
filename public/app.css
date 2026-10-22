@@ -63,7 +63,7 @@ p { margin: 0; }
 
 /* controls */
 input, select, textarea, button { font: inherit; color: inherit; }
-input[type="text"], input[type="password"], input[type="number"], select, textarea {
+input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {
   background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; min-width: 0; max-width: 100%;
 }
 textarea { resize: vertical; width: 100%; }
@@ -101,6 +101,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 /* tabs */
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .tab { border: 0; background: none; padding: 8px 14px; cursor: pointer; border-bottom: 3px solid transparent; font-weight: 500; color: var(--muted); }
+a.tab { text-decoration: none; }
 .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--navy); }
 
 /* summary tiles */
