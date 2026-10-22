@@ -68,7 +68,8 @@ Firebase プロジェクトは `point-check-9ca84` です。設定値は `public
 2. GitHub のリポジトリ → Settings → Secrets and variables → Actions → **New repository secret** を開きます。
    - 名前：`FIREBASE_SERVICE_ACCOUNT`
    - 値：ダウンロードした JSON の中身をすべて貼り付けます。
-3. Actions タブで「Firebase にデプロイ」を選び、**Run workflow** を押します（以降は push するたびに自動で動きます）。
+3. Google Cloud の IAM（https://console.cloud.google.com/iam-admin/iam?project=point-check-9ca84）で、鍵のサービスアカウント（`firebase-adminsdk-…`）に「Firebase ルール管理者」のロールを追加します（Firestore ルールのデプロイに必要）。
+4. Actions タブで「Firebase にデプロイ」を選び、**Run workflow** を押します（以降は push するたびに自動で動きます）。
 
 ダウンロードした鍵ファイルはプロジェクトの管理者権限を持つので、リポジトリには入れず、登録後は削除してください。
 
@@ -76,7 +77,7 @@ Firebase プロジェクトは `point-check-9ca84` です。設定値は `public
 ```bash
 npm install -g firebase-tools
 firebase login
-firebase deploy --only hosting,firestore
+firebase deploy --only hosting,firestore:rules
 ```
 
 ### 5. 登録コードを設定し、最初の教師アカウントを作る

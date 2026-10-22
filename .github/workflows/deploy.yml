@@ -43,7 +43,7 @@ jobs:
         if: always() && env.GOOGLE_APPLICATION_CREDENTIALS != ''
         run: |
           set -o pipefail
-          npx --yes firebase-tools@13 deploy --only firestore --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/firestore.log" || {
+          npx --yes firebase-tools@13 deploy --only firestore:rules --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/firestore.log" || {
             tail -n 25 "$RUNNER_TEMP/firestore.log" | sed 's/^/::error title=Firestore ルールのデプロイに失敗::/'
             exit 1
           }
