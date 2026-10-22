@@ -64,7 +64,15 @@ function h(tag, props, ...children) {
   }
   return el;
 }
-const mount = (...nodes) => { $main.replaceChildren(...nodes); window.scrollTo(0, 0); };
+// null / false を取り除いてから子要素を差し替える（そのままだと「null」という文字が表示される）
+const clean = (nodes) => nodes.flat(Infinity).filter((n) => n !== null && n !== undefined && n !== false);
+const fill = (el, ...nodes) => el.replaceChildren(...clean(nodes));
+// 描画を始めたあとに別の画面へ移っていたら、古い画面は表示しない
+const mount = (...nodes) => {
+  if (S.routeHash !== undefined && S.routeHash !== location.hash) return;
+  fill($main, nodes);
+  window.scrollTo(0, 0);
+};
 const fmt = (x) => (isNum(x) ? (Number.isInteger(x) ? String(x) : (Math.round(x * 10) / 10).toFixed(1)) : '—');
 const f1 = (x) => (isNum(x) ? (Math.round(x * 10) / 10).toFixed(1) : '—');
 const pct = (x) => (isNum(x) ? f1(x * 100) + '%' : '—');
@@ -143,7 +151,7 @@ function renderNav() {
   bar.hidden = false;
   const cur = location.hash || '#/';
   const link = (href, text) => h('a', { href, class: (href === '#/' ? cur === '#/' || cur === '' : cur.startsWith(href)) ? 'active' : '' }, text);
-  nav.replaceChildren(...[
+  fill(nav, ...[
     link('#/', '得点表'),
     isTeacher() ? link('#/t/users', '生徒・アカウント') : null,
     link('#/account', 'パスワード変更'),
@@ -152,7 +160,15 @@ function renderNav() {
   ].filter(Boolean));
 }
 
-async function route() {
+// 同じタイミングで何度呼ばれても描画は1回にまとめる（明示的な route() と hashchange が重なるため）
+let routeTimer = null;
+function route() {
+  clearTimeout(routeTimer);
+  routeTimer = setTimeout(renderRoute, 0);
+}
+
+async function renderRoute() {
+  S.routeHash = location.hash;
   S.cleanups.splice(0).forEach((f) => { try { f(); } catch (e) { /* noop */ } });
   if (!S.ready || S.busy) return;
   const parts = (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean);
@@ -172,10 +188,11 @@ async function route() {
       if (parts[0] === 't' && parts[1] === 'users') return await viewUsers();
       if (parts[0] === 't' && parts[1] === 'wb' && parts[3] === 'edit') return await viewEditor(parts[2]);
       if (parts[0] === 't' && parts[1] === 'wb' && parts[3] === 'results') return await viewResults(parts[2]);
-      if (parts[0] === 't' && parts[1] === 'wb' && parts[3] === 'u') return await viewSheet(parts[2], parts[4], true);
+      if (parts[0] === 't' && parts[1] === 'wb' && parts[3] === 'u') return await viewSheet(parts[2], parts[4], parts[5] === 'edit' ? 'teacher-edit' : 'teacher-view');
+      if (parts[0] === 't' && parts[1] === 'wb' && parts[3] === 'preview') return await viewSheet(parts[2], PREVIEW_UID, 'preview');
       return await viewTeacherHome();
     }
-    if (parts[0] === 'wb' && parts[1]) return await viewSheet(parts[1], S.user.uid, false);
+    if (parts[0] === 'wb' && parts[1]) return await viewSheet(parts[1], S.user.uid, 'student');
     return await viewStudentHome();
   } catch (e) {
     console.error(e);
@@ -457,6 +474,9 @@ async function viewStudentHome() {
   const wbs = wbSnap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => a.title.localeCompare(b.title, 'ja'));
 
   const recent = [];
+  let cat = loadCat();
+  const counts = { kyotsu: wbs.filter(isKyotsu).length, other: wbs.filter((w) => !isKyotsu(w)).length };
+  if (!counts[cat] && counts[cat === 'kyotsu' ? 'other' : 'kyotsu']) cat = cat === 'kyotsu' ? 'other' : 'kyotsu';
   const cards = wbs.map((wb) => {
     const idx = indexWorkbook(wb);
     const rec = mine[wb.id] || {};
@@ -469,7 +489,7 @@ async function viewStudentHome() {
     }
     const all = evalGroup(idx.all, scores);
     const total = idx.rounds.size;
-    return h('a', { class: 'card wb-card', href: `#/wb/${wb.id}` },
+    return h('a', { class: 'card wb-card', href: `#/wb/${wb.id}`, 'data-cat': catOf(wb) },
       h('div', { class: 'row' }, h('h2', null, wb.title), h('span', { class: 'spacer' }), all.count ? h('span', { class: 'pill accent' }, `得点率 ${pct(all.rate)}`) : h('span', { class: 'pill muted' }, '未記入')),
       wb.description ? h('p', { class: 'small muted' }, wb.description) : null,
       h('div', { class: 'progress', 'aria-hidden': 'true' }, h('div', { style: `width:${total ? (done / total) * 100 : 0}%` })),
@@ -487,28 +507,45 @@ async function viewStudentHome() {
       h('td', { class: 'r num' }, `${fmt(r.g.sum)} / ${fmt(r.g.complete ? r.g.max : r.g.enteredMax)}`),
       h('td', { class: `r num ${heat(r.g.rate)}` }, pct(r.g.rate))))))) : null;
 
+  const listBox = h('div', { class: 'wb-list' });
+  const emptyBox = h('div', { class: 'card' }, h('h2', null, 'まだ得点表がありません'), h('p', { class: 'muted' }, '先生が得点表を公開すると、ここに表示されます。'));
+  const showCat = () => {
+    const shown = cards.filter((c) => c.dataset.cat === cat);
+    fill(listBox, shown);
+    listBox.hidden = !shown.length;
+    emptyBox.hidden = !!shown.length;
+  };
   mount(
     h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, `出席番号 ${S.profile.studentNo}　${S.profile.displayName}`), h('h1', null, '自分の得点表'))),
-    wbs.length ? h('div', { class: 'wb-list' }, cards)
-      : h('div', { class: 'card' }, h('h2', null, 'まだ得点表がありません'), h('p', { class: 'muted' }, '先生が得点表を公開すると、ここに表示されます。')),
+    catTabs(cat, counts, (k) => { cat = k; showCat(); }),
+    listBox, emptyBox,
     recentTable ? h('section', { class: 'stack' }, h('h2', null, '最近の記録'), recentTable) : null,
   );
+  showCat();
 }
 
-// ---------------------------------------------------------------- 得点表（生徒の記入画面・先生の閲覧画面）
-async function viewSheet(wbId, uid, teacherMode) {
+// ---------------------------------------------------------------- 得点表（生徒の記入画面・先生の閲覧/修正画面・プレビュー）
+// mode: 'student'（本人が記入） / 'teacher-view'（先生が閲覧） / 'teacher-edit'（先生が点数を修正） / 'preview'（先生のお試し。保存しない）
+const PREVIEW_UID = '__preview__';
+async function viewSheet(wbId, uid, mode) {
   const wbSnap = await getDoc(doc(db, 'workbooks', wbId));
   if (!wbSnap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const wb = { id: wbId, ...wbSnap.data() };
   const idx = indexWorkbook(wb);
+  const kyotsu = isKyotsu(wb);
+  const isPreview = mode === 'preview';
+  const teacherMode = mode === 'teacher-view' || mode === 'teacher-edit';
+  const canScores = mode !== 'teacher-view';
+  const canNotes = mode === 'student' || isPreview;
   const scoreRef = doc(db, 'scores', `${wbId}_${uid}`);
   const noteRef = doc(db, 'notes', `${wbId}_${uid}`);
-  const [sSnap, nSnap, pSnap] = await Promise.all([
+  const [sSnap, nSnap, pSnap] = isPreview ? [null, null, null] : await Promise.all([
     getDoc(scoreRef), getDoc(noteRef), teacherMode ? getDoc(doc(db, 'users', uid)) : Promise.resolve(null),
   ]);
-  const student = teacherMode ? (pSnap.exists() ? pSnap.data() : { displayName: '（削除されたユーザー）' }) : S.profile;
-  const sd = sSnap.exists() ? sSnap.data() : {};
-  const nd = nSnap.exists() ? nSnap.data() : {};
+  const student = isPreview ? { displayName: 'プレビュー（保存されません）' }
+    : teacherMode ? (pSnap.exists() ? pSnap.data() : { displayName: '（削除されたユーザー）' }) : S.profile;
+  const sd = sSnap && sSnap.exists() ? sSnap.data() : {};
+  const nd = nSnap && nSnap.exists() ? nSnap.data() : {};
   const st = {
     scores: { ...(sd.scores || {}) },
     dates: { ...(sd.dates || {}) },
@@ -516,12 +553,21 @@ async function viewSheet(wbId, uid, teacherMode) {
     entries: JSON.parse(JSON.stringify(nd.entries || {})),
     others: {},
   };
-  const editable = !teacherMode;
   const refs = { items: {}, rounds: {}, sets: {} };
+  // 共通テスト: 目標は「全体を通して1つ」。1セットの満点（いちばん大きいもの）に対する点数で持つ。
+  const setMax = (set) => evalGroup(idx.sets.get(set.id) || [], {}).max;
+  const refMax = Math.max(0, ...(wb.sets || []).map(setMax));
+  const setTarget = (set) => {
+    if (kyotsu) return isNum(st.goal) && refMax > 0 ? Math.round((st.goal * setMax(set) / refMax) * 10) / 10 : null;
+    const t = (st.entries[set.id] || {}).target;
+    return isNum(t) ? t : null;
+  };
 
   // ---- 保存（入力が止まって少ししたら自動保存）
-  const saveEl = h('span', { class: 'save-state muted' }, editable ? '自動で保存されます' : '閲覧のみ');
+  const saveEl = h('span', { class: 'save-state muted' },
+    isPreview ? 'プレビュー: 入力は保存されません' : mode === 'teacher-view' ? '閲覧のみ' : mode === 'teacher-edit' ? '先生による修正: 自動で保存されます' : '自動で保存されます');
   const setSave = (state, text) => {
+    if (isPreview) return;
     saveEl.className = 'save-state ' + (state === 'error' ? 'err' : state === 'saved' ? 'ok' : 'muted');
     saveEl.textContent = text;
   };
@@ -533,15 +579,17 @@ async function viewSheet(wbId, uid, teacherMode) {
       if (evalGroup(idx.rounds.get(r) || [], st.scores).count) st.dates[r] = today(); else delete st.dates[r];
     }
     dirtyRounds.clear();
+    updateDates();
+    if (isPreview) return;
     setSave('saving', '保存中…');
     try {
       await setDoc(scoreRef, { wbId, uid, scores: st.scores, dates: st.dates, updatedAt: Date.now() });
       setSave('saved', '保存しました');
-      updateDates();
     } catch (e) { setSave('error', '保存できませんでした: ' + errMsg(e)); }
   }
   async function saveNotes() {
     clearTimeout(noteTimer); noteTimer = null;
+    if (isPreview) return;
     setSave('saving', '保存中…');
     try {
       await setDoc(noteRef, { wbId, uid, goal: st.goal, entries: st.entries, updatedAt: Date.now() });
@@ -550,7 +598,7 @@ async function viewSheet(wbId, uid, teacherMode) {
   }
   const queueScores = (roundId) => { dirtyRounds.add(roundId); setSave('dirty', '入力中…'); clearTimeout(scoreTimer); scoreTimer = setTimeout(saveScores, 700); };
   const queueNotes = () => { setSave('dirty', '入力中…'); clearTimeout(noteTimer); noteTimer = setTimeout(saveNotes, 900); };
-  const onBeforeUnload = (e) => { if (scoreTimer || noteTimer) { e.preventDefault(); e.returnValue = ''; } };
+  const onBeforeUnload = (e) => { if (!isPreview && (scoreTimer || noteTimer)) { e.preventDefault(); e.returnValue = ''; } };
   window.addEventListener('beforeunload', onBeforeUnload);
   S.cleanups.push(() => {
     window.removeEventListener('beforeunload', onBeforeUnload);
@@ -558,37 +606,62 @@ async function viewSheet(wbId, uid, teacherMode) {
     if (noteTimer) saveNotes();
   });
 
-  // ---- 入力欄
+  // ---- 入力欄（全角数字もそのまま受け付ける）
+  const toHalf = (s) => s.normalize('NFKC').trim();
   function scoreInput(item, roundId) {
     const v = validScore(item, st.scores);
-    if (!editable) return h('span', { class: 'val' }, v === null ? '—' : fmt(v));
+    if (!canScores) return h('span', { class: 'val' }, v === null ? '—' : fmt(v));
     const inp = h('input', {
-      type: 'text', inputmode: 'decimal', value: v === null ? '' : String(v), 'aria-label': `${item.label} ${item.fieldName || ''} 得点（満点${item.max}）`,
+      type: 'text', inputmode: 'decimal', enterkeyhint: 'next', autocomplete: 'off',
+      value: v === null ? '' : String(v), 'aria-label': `${item.roundLabel} ${item.label} ${item.fieldName || ''} 得点（満点${item.max}）`,
     });
-    inp.addEventListener('input', () => {
-      const raw = inp.value.trim().replace(/[０-９．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
-      if (raw === '') { delete st.scores[item.id]; inp.classList.remove('invalid'); }
+    const apply = () => {
+      const raw = toHalf(inp.value);
+      if (raw === '') { delete st.scores[item.id]; inp.classList.remove('invalid'); inp.title = ''; }
       else {
         const n = Number(raw);
         if (!Number.isFinite(n) || n < 0 || n > item.max) { inp.classList.add('invalid'); inp.title = `0〜${item.max}で入力してください`; return; }
         inp.classList.remove('invalid'); inp.title = '';
+        if (st.scores[item.id] === n) return;
         st.scores[item.id] = n;
       }
       recompute();
       queueScores(roundId);
+    };
+    inp.addEventListener('input', (e) => { if (!e.isComposing) apply(); });
+    inp.addEventListener('compositionend', apply);
+    inp.addEventListener('change', apply);
+    // Enter で次の欄へ
+    inp.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      apply();
+      const all = [...document.querySelectorAll('.item-body input')];
+      const next = all[all.indexOf(inp) + 1];
+      if (next) next.focus(); else inp.blur();
     });
     return inp;
   }
   const fieldName = Object.fromEntries((wb.fields || []).map((f) => [f.id, f.name]));
+  const numberInput = (value, label, onValue) => {
+    const el = h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'off', value: isNum(value) ? String(value) : '', 'aria-label': label });
+    const apply = () => {
+      const raw = toHalf(el.value); const n = Number(raw);
+      if (raw === '') onValue(null); else if (Number.isFinite(n) && n >= 0) onValue(n); else return;
+    };
+    el.addEventListener('input', (e) => { if (!e.isComposing) apply(); });
+    el.addEventListener('compositionend', apply);
+    return el;
+  };
 
-  function renderSet(set, si) {
+  function renderSet(set) {
     const rounds = (set.rounds || []).map((round) => {
       const items = (round.items || []).map((item) => {
         const avgEl = h('div', { class: 'item-avg' });
         refs.items[item.id] = { avgEl };
         return h('div', { class: 'item' },
           h('div', { class: 'item-head' }, item.label ? h('span', { class: 'qno' }, item.label) : null, h('span', null, fieldName[item.fieldId] || '')),
-          h('div', { class: 'item-body' }, scoreInput({ ...item, fieldName: fieldName[item.fieldId] }, round.id), h('span', { class: 'max' }, `/${fmt(item.max)}`)),
+          h('div', { class: 'item-body' }, scoreInput({ ...item, fieldName: fieldName[item.fieldId], roundLabel: round.label }, round.id), h('span', { class: 'max' }, `/${fmt(item.max)}`)),
           avgEl);
       });
       const subV = h('span', { class: 'v' });
@@ -596,26 +669,24 @@ async function viewSheet(wbId, uid, teacherMode) {
       refs.rounds[round.id] = { subV, dateEl };
       return h('div', { class: 'round' },
         h('div', { class: 'round-label' }, h('span', null, round.label), dateEl),
-        h('div', { class: 'items' }, items),
+        h('div', { class: 'items' }, items.length ? items : h('span', { class: 'small muted' }, '問題がありません')),
         h('div', { class: 'subtotal' }, h('span', { class: 'k' }, '小計'), subV, h('span', { class: 'm' }, `/${fmt(evalGroup(idx.rounds.get(round.id), {}).max)}`)));
     });
 
     const entry = st.entries[set.id] || {};
-    let targetEl;
-    if (editable) {
-      targetEl = h('input', { type: 'text', inputmode: 'numeric', value: isNum(entry.target) ? String(entry.target) : '', 'aria-label': `${set.label} 目標点` });
-      targetEl.addEventListener('input', () => {
-        const n = Number(targetEl.value.trim());
-        const e = (st.entries[set.id] = st.entries[set.id] || {});
-        if (targetEl.value.trim() === '') delete e.target;
-        else if (Number.isFinite(n) && n >= 0) e.target = n;
-        else return;
-        recompute(); queueNotes();
-      });
-    } else targetEl = h('span', { class: 'num' }, isNum(entry.target) ? fmt(entry.target) : '—');
+    let targetBox;
+    const targetText = h('span', { class: 'num' });
+    if (kyotsu) {
+      targetBox = h('div', { class: 'target' }, h('span', { class: 'label' }, '目標（全体）'), h('span', null, targetText, '点'));
+    } else {
+      const targetEl = canNotes
+        ? numberInput(entry.target, `${set.label} 目標点`, (n) => { const e = (st.entries[set.id] = st.entries[set.id] || {}); if (n === null) delete e.target; else e.target = n; recompute(); queueNotes(); })
+        : h('span', { class: 'num' }, isNum(entry.target) ? fmt(entry.target) : '—');
+      targetBox = h('label', { class: 'target' }, h('span', { class: 'label' }, '目標'), h('span', { class: 'row', style: 'gap:4px' }, targetEl, '点'));
+    }
 
     let memoEl;
-    if (editable) {
+    if (canNotes) {
       memoEl = h('textarea', { rows: 2, maxlength: 500, placeholder: '振り返り・メモ', 'aria-label': `${set.label} 振り返り・メモ` });
       memoEl.value = entry.memo || '';
       memoEl.addEventListener('input', () => { (st.entries[set.id] = st.entries[set.id] || {}).memo = memoEl.value; queueNotes(); });
@@ -624,36 +695,35 @@ async function viewSheet(wbId, uid, teacherMode) {
     const totV = h('div', { class: 'v' });
     const cmpEl = h('div', { class: 'set-cmp' });
     const badgeEl = h('div');
-    refs.sets[set.id] = { totV, cmpEl, badgeEl };
+    refs.sets[set.id] = { totV, cmpEl, badgeEl, targetText };
     const m = set.label.match(/^(\D*)(\d+)$/);
     return h('section', { class: 'set' },
       h('div', { class: 'set-badge' }, h('span', { class: 's1' }, m ? m[1] : ''), h('span', { class: 's2' }, m ? m[2] : set.label)),
       h('div', { class: 'set-rounds' }, rounds),
       h('div', { class: 'set-side' },
-        h('label', { class: 'target' }, h('span', { class: 'label' }, '目標'), h('span', { class: 'row', style: 'gap:4px' }, targetEl, '点')),
+        targetBox,
         h('div', { class: 'set-total' }, h('span', { class: 'label' }, '合計'), totV, badgeEl),
         cmpEl,
         h('div', { class: 'memo field' }, h('span', { class: 'label' }, '振り返り・メモ'), memoEl)));
   }
 
   // ---- 上部のまとめ
-  let goalEl;
-  if (editable) {
-    goalEl = h('input', { type: 'text', inputmode: 'numeric', value: isNum(st.goal) ? String(st.goal) : '', 'aria-label': '最終目標' });
-    goalEl.addEventListener('input', () => {
-      const raw = goalEl.value.trim(); const n = Number(raw);
-      if (raw === '') st.goal = null; else if (Number.isFinite(n) && n >= 0) st.goal = n; else return;
-      queueNotes();
-    });
-  } else goalEl = h('span', { class: 'v' }, isNum(st.goal) ? fmt(st.goal) : '—');
+  const goalEl = canNotes
+    ? numberInput(st.goal, kyotsu ? '目標点（全体を通して）' : '最終目標', (n) => { st.goal = n; recompute(); queueNotes(); })
+    : h('span', { class: 'v' }, isNum(st.goal) ? fmt(st.goal) : '—');
   const T = {};
   const tile = (key, label) => { T[key] = h('span', { class: 'v' }); return h('div', { class: 'tile' }, h('span', { class: 'label' }, label), T[key]); };
   const tiles = h('div', { class: 'tiles' },
-    h('div', { class: 'tile' }, h('span', { class: 'label' }, '最終目標'), h('span', { class: 'goal-input' }, goalEl, h('span', { class: 'muted small' }, '点'))),
+    h('div', { class: 'tile' + (kyotsu ? ' goal-tile' : '') },
+      h('span', { class: 'label' }, kyotsu ? '目標点（全体を通して）' : '最終目標'),
+      h('span', { class: 'goal-input' }, goalEl, h('span', { class: 'muted small' }, kyotsu && refMax ? `点 / ${fmt(refMax)}点` : '点')),
+      kyotsu ? h('span', { class: 'small muted' }, 'すべての回・セットに共通の目標です') : null),
+    kyotsu ? tile('achieved', '目標を達成したセット') : null,
     tile('progress', '記入済み'), tile('rate', '得点率（記入済みの問題）'), tile('avg', 'クラス平均の得点率'), tile('rank', '順位（得点率）'), tile('dev', '偏差値'));
 
   const fieldsBox = h('div', { class: 'fields' });
-  const sheetBox = h('div', { class: 'sheet' }, (wb.sets || []).map(renderSet));
+  const sheetBox = h('div', { class: 'sheet' }, (wb.sets || []).length ? (wb.sets || []).map(renderSet)
+    : h('div', { class: 'card' }, h('p', { class: 'muted' }, 'この得点表にはまだ問題が設定されていません。')));
   const tabSheet = h('button', { class: 'tab', role: 'tab', 'aria-selected': 'true', type: 'button' }, '得点表');
   const tabFields = h('button', { class: 'tab', role: 'tab', 'aria-selected': 'false', type: 'button' }, '分野別チェック');
   const fieldsWrap = h('div', { class: 'stack', hidden: true },
@@ -687,15 +757,18 @@ async function viewSheet(wbId, uid, teacherMode) {
       r.subV.textContent = g.count ? fmt(g.sum) : '';
       r.subV.className = 'v' + (g.count && !g.complete ? ' partial' : '');
     }
+    let achieved = 0, completedSets = 0;
     for (const set of wb.sets || []) {
       const g = evalGroup(idx.sets.get(set.id), st.scores);
       const r = refs.sets[set.id];
-      r.totV.replaceChildren(g.count ? fmt(g.sum) : '', h('small', null, ` /${fmt(g.max)}`));
-      const target = (st.entries[set.id] || {}).target;
-      r.badgeEl.replaceChildren(
+      const target = setTarget(set);
+      if (kyotsu) r.targetText.textContent = target === null ? '—' : fmt(target);
+      fill(r.totV, g.count ? fmt(g.sum) : '', h('small', null, ` /${fmt(g.max)}`));
+      if (g.complete) { completedSets++; if (target !== null && g.sum >= target) achieved++; }
+      fill(r.badgeEl,
         !g.count ? h('span', { class: 'small muted' }, '未記入')
           : !g.complete ? h('span', { class: 'small muted' }, '記入途中')
-            : isNum(target) ? (g.sum >= target ? h('span', { class: 'pill good' }, '目標達成') : h('span', { class: 'pill warn' }, `目標まであと${fmt(target - g.sum)}点`)) : null);
+            : target !== null ? (g.sum >= target ? h('span', { class: 'pill good' }, '目標達成') : h('span', { class: 'pill warn' }, `目標まであと${fmt(Math.round((target - g.sum) * 10) / 10)}点`)) : null);
       const lines = [];
       const sStat = stats.sets[set.id];
       if (sStat.n) lines.push(h('div', null, `平均 ${f1(sStat.avg)}点（${sStat.n}人）`, sStat.rank ? ` ・ ${sStat.rank}位` : ''));
@@ -703,25 +776,26 @@ async function viewSheet(wbId, uid, teacherMode) {
         const rs = stats.rounds[round.id];
         if (rs.n) lines.push(h('div', null, `${round.label}: 平均 ${f1(rs.avg)}`, rs.rank ? ` ・ ${rs.rank}位/${rs.n}人` : ` （${rs.n}人）`));
       }
-      r.cmpEl.replaceChildren(...lines);
+      fill(r.cmpEl, lines);
     }
 
     let done = 0;
     for (const items of idx.rounds.values()) if (evalGroup(items, st.scores).complete) done++;
     const me = evalGroup(idx.all, st.scores);
     const o = stats.overall;
-    T.progress.replaceChildren(String(done), h('small', null, `/ ${idx.rounds.size}回`));
-    T.rate.replaceChildren(pct(me.rate), me.count ? h('small', null, `${fmt(me.sum)}/${fmt(me.enteredMax)}`) : '');
-    T.avg.replaceChildren(o.n ? pct(o.avg) : '—', o.n ? h('small', null, `${o.n}人`) : '');
-    T.rank.replaceChildren(o.rank ? String(o.rank) : '—', o.rank ? h('small', null, `位 / ${o.n}人`) : '');
+    if (T.achieved) fill(T.achieved, isNum(st.goal) ? String(achieved) : '—', isNum(st.goal) ? h('small', null, `/ ${completedSets}セット（記入済み）`) : h('small', null, '目標点を入れると表示'));
+    fill(T.progress, String(done), h('small', null, `/ ${idx.rounds.size}回`));
+    fill(T.rate, pct(me.rate), me.count ? h('small', null, `${fmt(me.sum)}/${fmt(me.enteredMax)}`) : '');
+    fill(T.avg, o.n ? pct(o.avg) : '—', o.n ? h('small', null, `${o.n}人`) : '');
+    fill(T.rank, o.rank ? String(o.rank) : '—', o.rank ? h('small', null, `位 / ${o.n}人`) : '');
     T.dev.textContent = me.count && o.n > 1 ? f1(deviation(me.rate, o)) : '—';
 
     renderFields(stats);
   }
 
   function renderFields(stats) {
-    if (!(wb.fields || []).length) { fieldsBox.replaceChildren(h('p', { class: 'muted' }, 'この得点表には分野が設定されていません。')); return; }
-    fieldsBox.replaceChildren(...wb.fields.map((f) => {
+    if (!(wb.fields || []).length) { fill(fieldsBox, h('p', { class: 'muted' }, 'この得点表には分野が設定されていません。')); return; }
+    fill(fieldsBox, wb.fields.map((f) => {
       const items = idx.fields.get(f.id) || [];
       const g = evalGroup(items, st.scores);
       const fs = stats.fields[f.id];
@@ -748,76 +822,126 @@ async function viewSheet(wbId, uid, teacherMode) {
     const others = {};
     for (const d of snap.docs) {
       const data = d.data();
-      if (data.uid === uid) { if (!editable) { st.scores = { ...(data.scores || {}) }; st.dates = { ...(data.dates || {}) }; } continue; }
+      if (data.uid === uid) {
+        if (mode === 'teacher-view') { st.scores = { ...(data.scores || {}) }; st.dates = { ...(data.dates || {}) }; }
+        continue;
+      }
       others[data.uid] = data.scores || {};
     }
     st.others = others;
     recompute();
-    if (!editable) updateDates();
+    updateDates();
   }, (e) => setSave('error', '集計を読み込めませんでした: ' + errMsg(e)));
   S.cleanups.push(unsub);
 
   const nameLine = `${student.studentNo ? '出席番号 ' + student.studentNo + '　' : ''}${student.displayName}`;
+  const back = isPreview ? h('a', { href: '#/' }, '← 得点表の管理')
+    : teacherMode ? h('a', { href: `#/t/wb/${wbId}/results` }, '← 成績一覧') : h('a', { href: '#/' }, '← 自分の得点表');
+  const teacherSwitch = mode === 'teacher-view' ? h('a', { class: 'btn small', href: `#/t/wb/${wbId}/u/${uid}/edit` }, 'この生徒の点数を修正する')
+    : mode === 'teacher-edit' ? h('a', { class: 'btn small', href: `#/t/wb/${wbId}/u/${uid}` }, '修正を終える') : null;
   mount(
     h('div', { class: 'page-head' },
       h('div', null,
-        h('div', { class: 'eyebrow' }, teacherMode ? h('a', { href: `#/t/wb/${wbId}/results` }, '← 成績一覧') : h('a', { href: '#/' }, '← 自分の得点表')),
+        h('div', { class: 'eyebrow' }, back, '　', h('span', { class: 'pill ' + (kyotsu ? 'accent' : 'muted') }, kyotsu ? '共通テスト' : 'その他の演習')),
         h('h1', null, wb.title),
-        h('p', { class: 'small muted' }, teacherMode ? `${nameLine} さんの記録（閲覧のみ）` : nameLine)),
-      saveEl),
+        h('p', { class: 'small muted' }, teacherMode ? `${nameLine} さんの記録` : nameLine)),
+      h('div', { class: 'row' }, teacherSwitch, saveEl)),
+    isPreview ? h('p', { class: 'notice warn small' }, '生徒の画面のプレビューです。実際に点数を入れて動きを確かめられますが、入力した内容は保存されず、集計にも入りません。') : null,
     wb.description ? h('p', { class: 'notice' }, wb.description) : null,
     tiles,
     h('div', { class: 'tabs', role: 'tablist' }, tabSheet, tabFields),
     sheetBox,
     fieldsWrap,
-    editable ? h('p', { class: 'small muted' }, '点数は問題ごとに入力すると自動で保存されます。受けていない回は空欄のままにしてください。回・セットの順位は全問を記入した人どうしで比べます。') : null,
+    canScores ? h('p', { class: 'small muted' }, '点数を入れると自動で保存されます（Enter で次の欄へ）。受けていない回は空欄のままにしてください。回・セットの順位は全問を記入した人どうしで比べます。') : null,
   );
   updateDates();
   recompute();
+}
+
+// ---------------------------------------------------------------- 共通テスト / その他の演習 のタブ
+const CATS = [['kyotsu', '共通テスト専用得点表'], ['other', 'その他の演習']];
+const isKyotsu = (wb) => wb.category === 'kyotsu';
+const catOf = (wb) => (isKyotsu(wb) ? 'kyotsu' : 'other');
+function loadCat() { try { return localStorage.getItem('cat') === 'other' ? 'other' : 'kyotsu'; } catch (e) { return 'kyotsu'; } }
+function saveCat(c) { try { localStorage.setItem('cat', c); } catch (e) { /* noop */ } }
+function catTabs(current, counts, onChange) {
+  const tabs = CATS.map(([k, label]) => {
+    const b = h('button', { class: 'tab', type: 'button', role: 'tab', 'aria-selected': String(k === current) }, label, h('span', { class: 'muted small' }, ` ${counts[k] || 0}`));
+    b.onclick = () => { tabs.forEach((t, i) => t.setAttribute('aria-selected', String(CATS[i][0] === k))); saveCat(k); onChange(k); };
+    return b;
+  });
+  return h('div', { class: 'tabs', role: 'tablist' }, tabs);
 }
 
 // ---------------------------------------------------------------- teacher: home
 async function viewTeacherHome() {
   const snap = await getDocs(collection(db, 'workbooks'));
   const wbs = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  const titleIn = h('input', { type: 'text', id: 'new-wb', placeholder: '例: 数学Ⅰ・A 共通テスト対策 得点表', maxlength: 60, style: 'flex:1;min-width:12em' });
+  let cat = loadCat();
+  const counts = { kyotsu: wbs.filter(isKyotsu).length, other: wbs.filter((w) => !isKyotsu(w)).length };
+
+  const titleIn = h('input', { type: 'text', id: 'new-wb', maxlength: 60, style: 'flex:1;min-width:12em' });
   const msg = h('span', { class: 'err' });
+  const createTitle = h('h2');
   const createBtn = h('button', { class: 'btn primary', type: 'button' }, '作成して編集');
   createBtn.onclick = async () => {
     const title = titleIn.value.trim();
     if (!title) { msg.textContent = '得点表の名前を入力してください。'; return; }
     createBtn.disabled = true;
     try {
-      const ref = await addDoc(collection(db, 'workbooks'), { title, description: '', published: false, fields: [], sets: [], createdAt: Date.now(), updatedAt: Date.now() });
+      const ref = await addDoc(collection(db, 'workbooks'), { title, description: '', category: cat, published: false, fields: [], sets: [], createdAt: Date.now(), updatedAt: Date.now() });
       location.hash = `#/t/wb/${ref.id}/edit`;
     } catch (e) { msg.textContent = errMsg(e); createBtn.disabled = false; }
   };
 
-  const list = wbs.map((wb) => {
-    const idx = indexWorkbook(wb);
-    const pubBtn = h('button', { class: 'btn small', type: 'button' }, wb.published ? '非公開にする' : '生徒に公開する');
-    pubBtn.onclick = async () => {
-      pubBtn.disabled = true;
-      try { await updateDoc(doc(db, 'workbooks', wb.id), { published: !wb.published, updatedAt: Date.now() }); route(); }
-      catch (e) { toast(errMsg(e)); pubBtn.disabled = false; }
+  async function copyWorkbook(wb) {
+    const copy = {
+      title: `${wb.title}（コピー）`.slice(0, 60), description: wb.description || '', category: catOf(wb), published: false,
+      fields: wb.fields || [], sets: wb.sets || [], createdAt: Date.now(), updatedAt: Date.now(),
     };
-    return h('div', { class: 'card' },
-      h('div', { class: 'row' }, h('h2', null, wb.title), wb.published ? h('span', { class: 'pill good' }, '公開中') : h('span', { class: 'pill muted' }, '非公開')),
-      h('p', { class: 'small muted' }, `${(wb.sets || []).length}セット ・ ${idx.rounds.size}回 ・ ${idx.all.length}問 ・ 分野 ${(wb.fields || []).length}`),
-      h('div', { class: 'row' },
-        h('a', { class: 'btn primary small', href: `#/t/wb/${wb.id}/results` }, '成績一覧'),
-        h('a', { class: 'btn small', href: `#/t/wb/${wb.id}/edit` }, '構成を編集'),
-        pubBtn));
-  });
+    try {
+      const ref = await addDoc(collection(db, 'workbooks'), copy);
+      toast('コピーしました。名前などを変えてから公開してください');
+      location.hash = `#/t/wb/${ref.id}/edit`;
+    } catch (e) { toast(errMsg(e)); }
+  }
+
+  const listBox = h('div', { class: 'wb-list' });
+  function renderList() {
+    createTitle.textContent = cat === 'kyotsu' ? '新しい共通テスト得点表を作る' : '新しい演習の得点表を作る';
+    titleIn.placeholder = cat === 'kyotsu' ? '例: 数学Ⅰ・A 共通テスト対策 得点表' : '例: 二次試験対策 数学 演習プリント';
+    const shown = wbs.filter((w) => catOf(w) === cat);
+    if (!shown.length) { fill(listBox, h('p', { class: 'muted' }, 'まだ得点表がありません。上のフォームから作成してください。')); return; }
+    fill(listBox, shown.map((wb) => {
+      const idx = indexWorkbook(wb);
+      const pubBtn = h('button', { class: 'btn small', type: 'button' }, wb.published ? '非公開にする' : '生徒に公開する');
+      pubBtn.onclick = async () => {
+        pubBtn.disabled = true;
+        try { await updateDoc(doc(db, 'workbooks', wb.id), { published: !wb.published, updatedAt: Date.now() }); route(); }
+        catch (e) { toast(errMsg(e)); pubBtn.disabled = false; }
+      };
+      return h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('h2', null, wb.title), wb.published ? h('span', { class: 'pill good' }, '公開中') : h('span', { class: 'pill warn' }, '非公開（生徒には見えません）')),
+        h('p', { class: 'small muted' }, `${(wb.sets || []).length}セット ・ ${idx.rounds.size}回 ・ ${idx.all.length}問 ・ 分野 ${(wb.fields || []).length}`),
+        h('div', { class: 'row' },
+          h('a', { class: 'btn primary small', href: `#/t/wb/${wb.id}/results` }, '成績一覧'),
+          h('a', { class: 'btn small', href: `#/t/wb/${wb.id}/edit` }, '構成を編集'),
+          h('a', { class: 'btn small', href: `#/t/wb/${wb.id}/preview` }, '生徒の画面を試す'),
+          h('button', { class: 'btn small', type: 'button', onclick: () => copyWorkbook(wb) }, 'コピー'),
+          pubBtn));
+    }));
+  }
 
   mount(
     h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '先生用'), h('h1', null, '得点表の管理'))),
+    catTabs(cat, counts, (k) => { cat = k; renderList(); }),
     h('div', { class: 'card' },
-      h('h2', null, '新しい得点表を作る'),
-      h('p', { class: 'small muted' }, '教材やテストごとに1つ作ります。作成後に、セット・回・問題（番号・分野・配点）を設定します。'),
+      createTitle,
+      h('p', { class: 'small muted' }, '教材やテストごとに1つ作ります。作成後に、セット・回・問題（番号・分野・配点）を設定し、「生徒に公開する」を押すと生徒が記入できるようになります。似た構成の得点表は「コピー」から作ると早いです。'),
       h('div', { class: 'row' }, titleIn, createBtn), msg),
-    wbs.length ? h('div', { class: 'wb-list' }, list) : h('p', { class: 'muted' }, 'まだ得点表がありません。上のフォームから作成してください。'),
+    listBox,
   );
+  renderList();
 }
 
 // ---------------------------------------------------------------- teacher: editor
@@ -825,7 +949,7 @@ async function viewEditor(wbId) {
   const snap = await getDoc(doc(db, 'workbooks', wbId));
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const orig = snap.data();
-  const wb = JSON.parse(JSON.stringify({ title: orig.title, description: orig.description || '', published: !!orig.published, fields: orig.fields || [], sets: orig.sets || [] }));
+  const wb = JSON.parse(JSON.stringify({ title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, fields: orig.fields || [], sets: orig.sets || [] }));
   let dirty = false;
   const markDirty = () => { dirty = true; statusEl.textContent = '未保存の変更があります'; statusEl.className = 'small err'; };
   const statusEl = h('span', { class: 'small muted' }, '');
@@ -882,6 +1006,14 @@ async function viewEditor(wbId) {
         h('button', { class: 'btn small', type: 'button', onclick: () => move(wb.sets, si, -1) }, '↑'),
         h('button', { class: 'btn small', type: 'button', onclick: () => move(wb.sets, si, 1) }, '↓'),
         h('button', { class: 'btn small', type: 'button', onclick: () => { set.rounds.push(newRound()); markDirty(); render(); } }, '＋ 回を追加'),
+        h('button', {
+          class: 'btn small', type: 'button', title: 'このセットと同じ構成のセットを下に追加',
+          onclick: () => {
+            let n = nextRoundNo();
+            const copy = { id: rid('s_'), label: `セット${wb.sets.length + 1}`, rounds: set.rounds.map((r) => ({ id: rid('r_'), label: `第${n++}回`, items: r.items.map((i) => ({ ...i, id: rid('i_') })) })) };
+            wb.sets.splice(si + 1, 0, copy); markDirty(); render();
+          },
+        }, 'セットを複製'),
         confirmButton('セットを削除', 'もう一度押すと削除', async () => { wb.sets.splice(si, 1); markDirty(); render(); }, 'btn small')),
       set.rounds.map((round, ri) => h('div', { class: 'ed-round' },
         h('div', { class: 'ed-round-head' },
@@ -914,17 +1046,21 @@ async function viewEditor(wbId) {
       },
     }, '＋ セットを追加');
 
+    const catSel = h('select', { id: 'ed-cat' }, CATS.map(([k, label]) => h('option', { value: k, selected: wb.category === k }, label)));
+    catSel.addEventListener('change', () => { wb.category = catSel.value; markDirty(); });
     const pub = h('input', { type: 'checkbox', checked: wb.published, id: 'ed-pub' });
     pub.addEventListener('change', () => { wb.published = pub.checked; markDirty(); });
     const desc = h('textarea', { rows: 2, maxlength: 300, id: 'ed-desc', placeholder: '例: 奇数回と偶数回の2回で1セット（100点満点）。解く前にセットごとの目標点を書こう。' });
     desc.value = wb.description;
     desc.addEventListener('input', () => { wb.description = desc.value; markDirty(); });
 
-    box.replaceChildren(
+    fill(box, 
       h('div', { class: 'card' },
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-title' }, '得点表の名前'), textIn(wb, 'title', { id: 'ed-title', maxlength: 60 })),
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-desc' }, '説明（生徒の画面の上に表示）'), desc),
-        h('label', { class: 'row' }, pub, '生徒に公開する')),
+        h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-cat' }, '種類'), catSel,
+          h('span', { class: 'small muted' }, '共通テスト専用得点表では、セットごとの目標ではなく、全体を通した目標点を生徒が1つ設定します。')),
+        h('label', { class: 'row' }, pub, '生徒に公開する（オンにすると生徒が記入できます）')),
       h('div', { class: 'card' },
         h('h2', null, '分野'),
         h('p', { class: 'small muted' }, '「分野別チェック」で集計する単位です。問題ごとにどの分野かを選びます。'),
@@ -953,7 +1089,7 @@ async function viewEditor(wbId) {
     }
     if (problems.length) { statusEl.textContent = [...new Set(problems)].join(' '); statusEl.className = 'small err'; return; }
     const clean = {
-      title: wb.title.trim(), description: wb.description.trim(), published: wb.published,
+      title: wb.title.trim(), description: wb.description.trim(), category: wb.category, published: wb.published,
       fields: wb.fields.map((f) => ({ id: f.id, name: f.name.trim() })),
       sets: wb.sets.map((s) => ({
         id: s.id, label: s.label.trim(),
@@ -991,7 +1127,7 @@ async function viewEditor(wbId) {
   render();
   mount(
     h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, h('a', { href: '#/' }, '← 得点表の管理')), h('h1', null, '得点表の構成を編集')),
-      h('a', { class: 'btn small', href: `#/t/wb/${wbId}/results` }, '成績一覧へ')),
+      h('div', { class: 'row' }, h('a', { class: 'btn small', href: `#/t/wb/${wbId}/preview` }, '生徒の画面を試す'), h('a', { class: 'btn small', href: `#/t/wb/${wbId}/results` }, '成績一覧へ'))),
     h('p', { class: 'notice warn small' }, '生徒が記入を始めた後に問題を削除すると、その問題の点数は集計に使われなくなります。配点や分野の変更はすぐに集計に反映されます。'),
     box,
     h('div', { class: 'sticky-save' }, saveBtn, statusEl, h('span', { class: 'spacer' }), delBtn),
@@ -1004,6 +1140,7 @@ async function viewResults(wbId) {
   if (!wbSnap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const wb = { id: wbId, ...wbSnap.data() };
   const idx = indexWorkbook(wb);
+  const kyotsuRef = Math.max(0, ...(wb.sets || []).map((s) => evalGroup(idx.sets.get(s.id) || [], {}).max));
   const [uSnap, nSnap] = await Promise.all([
     getDocs(query(collection(db, 'users'), where('role', '==', 'student'))),
     getDocs(query(collection(db, 'notes'), where('wbId', '==', wbId))),
@@ -1045,7 +1182,7 @@ async function viewResults(wbId) {
     if (st.sort === 'rate') rows.sort((a, b) => (b.overall.rate ?? -1) - (a.overall.rate ?? -1));
 
     const ov = describe(rates);
-    summary.replaceChildren(
+    fill(summary, 
       h('div', { class: 'tile' }, h('span', { class: 'label' }, '生徒数'), h('span', { class: 'v' }, String(rows.length), h('small', null, '人'))),
       h('div', { class: 'tile' }, h('span', { class: 'label' }, '記入している生徒'), h('span', { class: 'v' }, String(rates.length), h('small', null, '人'))),
       h('div', { class: 'tile' }, h('span', { class: 'label' }, '平均得点率'), h('span', { class: 'v' }, pct(ov.avg))),
@@ -1059,16 +1196,19 @@ async function viewResults(wbId) {
     const cellFor = (c, g, r) => {
       if (!g.count) return h('td', { class: 'r muted' }, '—');
       if (c.kind === 'rate') return h('td', { class: `r num ${heat(g.rate)}` }, pct(g.rate));
-      const target = c.set ? ((notes[r.s.uid] || {}).entries || {})[c.set.id]?.target : undefined;
+      const note = notes[r.s.uid] || {};
+      const target = !c.set ? undefined
+        : isKyotsu(wb) ? (isNum(note.goal) && kyotsuRef > 0 ? Math.round((note.goal * maxOf(c) / kyotsuRef) * 10) / 10 : undefined)
+          : (note.entries || {})[c.set.id]?.target;
       return h('td', { class: `r num ${g.complete ? heat(g.rate) : 'partial'}`, title: g.complete ? '' : `記入途中（${g.count}/${g.total}問）` },
         fmt(g.sum), g.complete ? '' : '*', isNum(target) ? h('span', { class: 'muted small' }, ` (目標${fmt(target)})`) : '');
     };
 
-    tableBox.replaceChildren(h('table', null,
+    fill(tableBox, h('table', null,
       h('thead', null, h('tr', null,
         h('th', { class: 'r' }, '出席番号'), h('th', { class: 'sticky' }, '名前'),
         cols.map((c) => h('th', { class: 'r' }, c.label, h('br'), h('span', null, c.kind === 'rate' ? `満点${fmt(maxOf(c))}` : `/${fmt(maxOf(c))}`))),
-        h('th', { class: 'r' }, '記入済み'), h('th', { class: 'r' }, '得点率'), h('th', { class: 'r' }, '順位'), h('th', { class: 'r' }, '最終目標'), h('th', null, '最終更新'))),
+        h('th', { class: 'r' }, '記入済み'), h('th', { class: 'r' }, '得点率'), h('th', { class: 'r' }, '順位'), h('th', { class: 'r' }, isKyotsu(wb) ? '目標点（全体）' : '最終目標'), h('th', null, '最終更新'))),
       h('tbody', null,
         h('tr', { class: 'avg-row' },
           h('td'), h('td', { class: 'sticky' }, '平均'),
@@ -1176,7 +1316,7 @@ async function viewUsers() {
     bulkMsg.className = 'small ' + (okRows.length === results.length ? 'ok' : 'err');
     bulkMsg.textContent = `${okRows.length}件作成しました` + (okRows.length < results.length ? `（${results.length - okRows.length}件は失敗）` : '') + '。初期パスワードはこの画面を離れると再表示できません。控えてから生徒に配ってください。';
     const tsv = ['出席番号\t名前\t初期パスワード', ...okRows.map((r) => [r.studentNo, r.displayName, r.password].join('\t'))].join('\n');
-    bulkResult.replaceChildren(
+    fill(bulkResult, 
       h('div', { class: 'row' },
         h('button', { class: 'btn small', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(tsv); toast('コピーしました（表計算ソフトに貼り付けられます）'); } catch (e) { toast('コピーできませんでした'); } } }, '一覧をコピー'),
         h('button', { class: 'btn small', type: 'button', onclick: () => downloadText(`初期パスワード_${today()}.csv`, tsv.replace(/\t/g, ',')) }, 'CSVで保存')),
@@ -1204,11 +1344,11 @@ async function viewUsers() {
 
   function renderList() {
     const cur = filterSel.value;
-    filterSel.replaceChildren(h('option', { value: '' }, 'すべて'), h('option', { value: 'teacher', selected: cur === 'teacher' }, '先生のみ'),
+    fill(filterSel, h('option', { value: '' }, 'すべて'), h('option', { value: 'teacher', selected: cur === 'teacher' }, '先生のみ'),
       prefixesOf(users).map((p) => h('option', { value: p, selected: p === cur }, `${p}xx`)));
     const f = filterSel.value;
     const shown = users.filter((u) => !f || (f === 'teacher' ? u.role === 'teacher' : u.role === 'student' && (u.studentNo || '').startsWith(f)));
-    listBox.replaceChildren(h('table', null,
+    fill(listBox, h('table', null,
       h('thead', null, h('tr', null, h('th', null, '出席番号 / メール'), h('th', null, '名前'), h('th', null, '役割'), h('th', null, 'パスワード'), h('th', null, '操作'))),
       h('tbody', null, shown.map((u) => userRow(u)))));
   }
@@ -1222,7 +1362,7 @@ async function viewUsers() {
     actions.append(h('button', { class: 'btn small', type: 'button', onclick: () => editRow() }, '名前を編集'));
     if (fns && student) {
       actions.append(confirmButton('パスワード再発行', 'もう一度押すと再発行', async () => {
-        try { const r = await call('resetPassword')({ uid: u.uid }); u.mustChangePassword = true; pwCell.replaceChildren(h('span', { class: 'num' }, `新しいパスワード: ${r.data.password}`)); }
+        try { const r = await call('resetPassword')({ uid: u.uid }); u.mustChangePassword = true; fill(pwCell, h('span', { class: 'num' }, `新しいパスワード: ${r.data.password}`)); }
         catch (e) { toast(errMsg(e)); }
       }, 'btn small'));
     }
@@ -1254,7 +1394,7 @@ async function viewUsers() {
           catch (e) { toast(errMsg(e)); }
         },
       }, '保存');
-      tr.replaceChildren(h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, nm), h('td'), h('td'),
+      fill(tr, h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, nm), h('td'), h('td'),
         h('td', { class: 'row', style: 'flex-wrap:nowrap' }, save, h('button', { class: 'btn small', type: 'button', onclick: () => renderList() }, 'やめる')));
     }
     return tr;
@@ -1269,7 +1409,7 @@ async function viewUsers() {
     catch (e) { tMsg.className = 'small err'; tMsg.textContent = errMsg(e); }
   }
   function renderEmails() {
-    tBox.replaceChildren(...teacherEmails.map((m) => h('div', { class: 'row' },
+    fill(tBox, ...teacherEmails.map((m) => h('div', { class: 'row' },
       h('span', { class: 'num' }, m),
       users.some((u) => u.email === m) ? h('span', { class: 'pill good' }, '登録済み') : h('span', { class: 'pill muted' }, '未登録'),
       m === S.profile.email ? null : h('button', { class: 'btn small danger', type: 'button', onclick: () => saveEmails(teacherEmails.filter((x) => x !== m)) }, '一覧から外す'))));

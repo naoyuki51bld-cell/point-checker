@@ -91,10 +91,14 @@ service cloud.firestore {
           && request.resource.data.scores is map
           && exists(/databases/$(database)/documents/workbooks/$(request.resource.data.wbId))
         ) || (
-          isTeacher() && resource != null
-          && request.resource.data.uid == resource.data.uid
-          && request.resource.data.wbId == resource.data.wbId
+          // 先生による点数の記入・修正（生徒のアカウントに対してだけ）
+          isTeacher()
+          && docId == request.resource.data.wbId + '_' + request.resource.data.uid
+          && (resource == null || (request.resource.data.uid == resource.data.uid && request.resource.data.wbId == resource.data.wbId))
+          && request.resource.data.keys().hasOnly(['wbId', 'uid', 'scores', 'dates', 'updatedAt'])
           && request.resource.data.scores is map
+          && exists(/databases/$(database)/documents/workbooks/$(request.resource.data.wbId))
+          && get(userPath(request.resource.data.uid)).data.role == 'student'
         );
       allow delete: if isTeacher();
     }
