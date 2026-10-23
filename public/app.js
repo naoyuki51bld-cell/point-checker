@@ -10,7 +10,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getFunctions, httpsCallable, connectFunctionsEmulator } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
 import { firebaseConfig, appConfig } from './firebase-config.js';
-import { evalGroup, validScore, isNum, describe, rankOf, deviation, compare, histogram, binOf, blockOf } from './stats.js';
+import { evalGroup, validScore, isNum, describe, rankOf, deviation, compare, histogram, binOf, blockOf, unchosenIds } from './stats.js';
 
 // ---------------------------------------------------------------- Firebase
 const fbApp = initializeApp(firebaseConfig);
@@ -582,23 +582,34 @@ function fieldRowsView(fields, items, allScores, myScores, myUid, chipLabel) {
   if (none.length) groups.push({ name: '分野なし', items: none });
   const shown = groups.filter((g) => g.items.length);
   if (!shown.length) return h('p', { class: 'muted small' }, '分野が設定された問題がありません。');
+  // 選ばなかった選択問題は、満点・分母に入れない
+  const skip = unchosenIds(items, myScores);
   return h('div', { class: 'fields' }, shown.map((grp) => {
     const g = evalGroup(grp.items, myScores);
+    const chosen = grp.items.filter((it) => !skip.has(it.id));
+    const myMax = evalGroup(chosen, {}).max;
     const fs = compare(grp.items, allScores, myUid, 'rate');
-    return h('div', { class: 'frow' },
-      h('div', { class: 'fname' }, h('b', null, grp.name), h('span', { class: 'small muted' }, `満点 ${fmt(g.max)}`)),
+    const allSkipped = !chosen.length;
+    return h('div', { class: 'frow' + (allSkipped ? ' skipped' : '') },
+      h('div', { class: 'fname' }, h('b', null, grp.name), h('span', { class: 'small muted' }, allSkipped ? '選択していません' : `満点 ${fmt(myMax)}`)),
       h('div', { class: 'chips' }, grp.items.map((it) => {
         const v = validScore(it, myScores);
-        return h('div', { class: 'chip' + (v === null ? ' empty' : '') },
+        const off = skip.has(it.id);
+        return h('div', { class: 'chip' + (off ? ' unchosen' : v === null ? ' empty' : '') },
           h('div', { class: 'ch' }, chipLabel(it)),
-          h('div', { class: 'cv' }, v === null ? '' : fmt(v), h('span', { class: 'm' }, `/${fmt(it.max)}`)));
+          h('div', { class: 'cv' }, off ? h('span', { class: 'm' }, '未選択') : [v === null ? '' : fmt(v), h('span', { class: 'm' }, `/${fmt(it.max)}`)]));
       })),
       h('div', { class: 'fres' },
-        h('div', { class: 'big' }, h('span', { class: 'num' }, `${fmt(g.sum)} /${fmt(g.max)}`), h('span', { class: `v ${heat(g.rate)}` }, pct(g.rate))),
+        h('div', { class: 'big' },
+          h('span', { class: 'num' }, g.count ? `${fmt(g.sum)} / ${fmt(g.enteredMax)}` : allSkipped ? '—' : `— / ${fmt(myMax)}`, g.count && g.enteredMax < myMax ? h('span', { class: 'muted small' }, ` （満点 ${fmt(myMax)}）`) : null),
+          h('span', { class: `v ${heat(g.rate)}` }, pct(g.rate))),
         h('div', { class: 'bar', 'aria-hidden': 'true' },
           g.count ? h('div', { class: 'fill', style: `width:${Math.min(100, g.rate * 100)}%` }) : null,
           fs.n ? h('div', { class: 'avg', style: `left:calc(${Math.min(100, fs.avg * 100)}% - 1px)` }) : null),
-        h('div', { class: 'small muted' }, fs.n ? `クラス平均 ${pct(fs.avg)}` : 'まだ比べられる記録がありません', fs.rank ? ` ・ ${fs.rank}位 / ${fs.n}人` : '')));
+        h('div', { class: 'small muted' },
+          fs.n ? `クラス平均 ${pct(fs.avg)}` : 'まだ比べられる記録がありません',
+          fs.n && grp.items.some((it) => it.cg) ? `（記入した${fs.n}人）` : '',
+          fs.rank ? ` ・ ${fs.rank}位 / ${fs.n}人` : '')));
   }));
 }
 const fieldLegend = () => h('div', { class: 'legend' }, h('span', null, h('i'), '得点率（記入済みの問題）'), h('span', null, h('i', { class: 'tick' }), 'クラス平均'));
@@ -964,11 +975,10 @@ async function viewSet(setId, uid, mode) {
   const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
   const members = (set.testIds || []).map((id) => testsById[id]).filter(Boolean);
   const items = setItems(set, testsById);
-  const setMaxPts = items.reduce((a, it) => a + it.max, 0);
 
   const T = {};
   const tile = (key, label) => { T[key] = h('span', { class: 'v' }); return h('div', { class: 'tile' }, h('span', { class: 'label' }, label), T[key]); };
-  const tiles = h('div', { class: 'tiles' }, tile('done', '記入済みのテスト'), tile('rate', '得点率（記入済み）'), tile('total', 'セット合計'), kyotsu ? tile('goal', '目標を達成したテスト') : null, tile('avg', 'クラス平均の得点率'), tile('rank', '順位（得点率）'), tile('dev', '偏差値'));
+  const tiles = h('div', { class: 'tiles' }, tile('done', '記入済みのテスト'), tile('rate', '得点率（記入済み）'), tile('total', 'セット合計（記入済み）'), kyotsu ? tile('goal', '目標を達成したテスト') : null, tile('avg', 'クラス平均の得点率'), tile('rank', '順位（得点率）'), tile('dev', '偏差値'));
   const tableBox = h('div', { class: 'tscroll' });
   const fieldsBox = h('div');
   const distBox = h('div');
@@ -1001,7 +1011,10 @@ async function viewSet(setId, uid, mode) {
       h('tbody', null, rows.length ? rows : h('tr', null, h('td', { class: 'muted' }, 'このセットにはまだテストがありません。')))));
     fill(T.done, String(done), h('small', null, `/ ${members.length}`));
     fill(T.rate, pct(me.rate), me.count ? h('small', null, `${fmt(me.sum)}/${fmt(me.enteredMax)}`) : '');
-    fill(T.total, me.complete ? fmt(me.sum) : '—', h('small', null, `/ ${fmt(setMaxPts)}`), me.complete && cmpTotal.rank ? h('small', null, `${cmpTotal.rank}位`) : '');
+    const myMax = evalGroup(items.filter((it) => !unchosenIds(items, my).has(it.id)), {}).max;
+    fill(T.total, me.count ? fmt(me.sum) : '—', h('small', null, `/ ${fmt(me.count ? me.enteredMax : myMax)}`),
+      me.count && me.enteredMax < myMax ? h('small', null, `（満点 ${fmt(myMax)}）`) : null,
+      me.complete && cmpTotal.rank ? h('small', null, ` ${cmpTotal.rank}位`) : null);
     if (T.goal) fill(T.goal, isNum(goal) ? String(achieved) : '—', isNum(goal) ? h('small', null, `/ ${done}`) : h('small', null, '目標点が未設定'));
     fill(T.avg, cmpRate.n ? pct(cmpRate.avg) : '—', cmpRate.n ? h('small', null, `${cmpRate.n}人`) : '');
     fill(T.rank, cmpRate.rank ? String(cmpRate.rank) : '—', cmpRate.rank ? h('small', null, `位 / ${cmpRate.n}人`) : '');

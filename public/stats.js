@@ -93,3 +93,25 @@ export function histogram(values, max, bins = 10) {
   return out;
 }
 export const binOf = (v, max, bins = 10) => Math.min(bins - 1, Math.max(0, Math.floor(v / (max / bins) + 1e-9)));
+
+// 選ばなかった選択問題（その選択グループで1つ以上の大問に記入しているのに、記入していない大問の問題）。
+// 分野ごとに切り出す前の、テスト／セット全体の問題で判定する。まだどれも選んでいないグループは対象外。
+export function unchosenIds(items, scores) {
+  const groups = new Map();
+  for (const it of items) {
+    if (!it.cg) continue;
+    let g = groups.get(it.cg);
+    if (!g) groups.set(it.cg, (g = new Map()));
+    let b = g.get(it.block);
+    if (!b) g.set(it.block, (b = { items: [], touched: false }));
+    b.items.push(it);
+    if (validScore(it, scores) !== null) b.touched = true;
+  }
+  const out = new Set();
+  for (const g of groups.values()) {
+    const bl = [...g.values()];
+    if (!bl.some((b) => b.touched)) continue;
+    for (const b of bl) if (!b.touched) for (const it of b.items) out.add(it.id);
+  }
+  return out;
+}
