@@ -107,7 +107,7 @@ service cloud.firestore {
           isStudent()
           && request.resource.data.uid == request.auth.uid
           && docId == request.resource.data.testId + '_' + request.auth.uid
-          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'date', 'updatedAt'])
+          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'choices', 'date', 'updatedAt'])
           && request.resource.data.scores is map
           && exists(/databases/$(database)/documents/tests/$(request.resource.data.testId))
         ) || (
@@ -115,7 +115,7 @@ service cloud.firestore {
           isTeacher()
           && docId == request.resource.data.testId + '_' + request.resource.data.uid
           && (resource == null || (request.resource.data.uid == resource.data.uid && request.resource.data.testId == resource.data.testId))
-          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'date', 'updatedAt'])
+          && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'choices', 'date', 'updatedAt'])
           && request.resource.data.scores is map
           && exists(/databases/$(database)/documents/tests/$(request.resource.data.testId))
           && get(userPath(request.resource.data.uid)).data.role == 'student'

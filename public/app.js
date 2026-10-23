@@ -10,7 +10,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getFunctions, httpsCallable, connectFunctionsEmulator } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
 import { firebaseConfig, appConfig } from './firebase-config.js';
-import { evalGroup, validScore, isNum, describe, rankOf, deviation, compare, histogram, binOf } from './stats.js';
+import { evalGroup, validScore, isNum, describe, rankOf, deviation, compare, histogram, binOf, blockOf } from './stats.js';
 
 // ---------------------------------------------------------------- Firebase
 const fbApp = initializeApp(firebaseConfig);
@@ -487,8 +487,17 @@ function catTabs(current, counts, onChange) {
 
 const docsOf = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 const byTitle = (a, b) => (a.title || '').localeCompare(b.title || '', 'ja', { numeric: true });
-const testMax = (t) => (t.questions || []).reduce((a, q) => a + (Number(q.max) || 0), 0);
-const qItems = (t) => (t.questions || []).map((q) => ({ ...q, max: Number(q.max) || 0, testId: t.id, testTitle: t.title }));
+// 選択問題のグループに属する問題には、cg（グループのキー）・pick（選ぶ数）・block（大問）を付ける
+const qItems = (t) => {
+  const groups = Object.fromEntries((t.choiceGroups || []).map((g) => [g.id, g]));
+  return (t.questions || []).map((q) => {
+    const g = q.choiceGroup && groups[q.choiceGroup];
+    return { ...q, max: Number(q.max) || 0, testId: t.id, testTitle: t.title, ...(g ? { cg: `${t.id}:${g.id}`, pick: Number(g.pick) || 1, block: blockOf(q) } : {}) };
+  });
+};
+// 満点（選択問題は選ぶ数のぶんだけ数える）
+const testMax = (t) => evalGroup(qItems(t), {}).max;
+const blockName = (b) => (/^\d+$/.test(b) ? `第${b}問` : b);
 
 async function loadFields(cat) {
   const s = await getDoc(doc(db, 'fieldLists', cat));
@@ -717,6 +726,7 @@ async function viewTest(testId, uid, mode) {
   const nd = nSnap && nSnap.exists() ? nSnap.data() : {};
   const st = {
     scores: { ...(sd.scores || {}) }, date: sd.date || '',
+    choices: JSON.parse(JSON.stringify(sd.choices || {})),
     target: isNum(nd.target) ? nd.target : null, memo: nd.memo || '',
     goal: gSnap && gSnap.exists() && isNum(gSnap.data().kyotsu) ? gSnap.data().kyotsu : null,
     others: {},
@@ -739,7 +749,7 @@ async function viewTest(testId, uid, mode) {
     if (isPreview) return;
     setSave('saving', '保存中…');
     try {
-      await setDoc(scoreRef, { testId, uid, scores: st.scores, date: st.date, updatedAt: Date.now() });
+      await setDoc(scoreRef, { testId, uid, scores: st.scores, choices: st.choices, date: st.date, updatedAt: Date.now() });
       setSave('saved', '保存しました');
     } catch (e) { setSave('error', '保存できませんでした: ' + errMsg(e)); }
   }
@@ -764,11 +774,12 @@ async function viewTest(testId, uid, mode) {
 
   // ---- 入力欄（全角数字・日本語入力の確定にも対応。Enter で次の欄へ）
   const avgEls = {};
-  function scoreInput(item) {
+  function scoreInput(item, disabled) {
     const v = validScore(item, st.scores);
     if (!canScores) return h('span', { class: 'val' }, v === null ? '—' : fmt(v));
     const inp = h('input', {
-      type: 'text', inputmode: 'decimal', enterkeyhint: 'next', autocomplete: 'off',
+      type: 'text', inputmode: 'decimal', enterkeyhint: 'next', autocomplete: 'off', disabled: !!disabled,
+      placeholder: disabled ? '未選択' : '',
       value: v === null ? '' : String(v), 'aria-label': `${item.label || ''} ${fieldName[item.fieldId] || ''} 得点（満点${item.max}）`,
     });
     const apply = () => {
@@ -789,19 +800,67 @@ async function viewTest(testId, uid, mode) {
     inp.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || e.isComposing) return;
       e.preventDefault(); apply();
-      const all = [...document.querySelectorAll('.item-body input')];
+      const all = [...document.querySelectorAll('.item-body input:not(:disabled)')];
       const next = all[all.indexOf(inp) + 1];
       if (next) next.focus(); else inp.blur();
     });
     return inp;
   }
-  const questionGrid = h('div', { class: 'items qgrid' }, items.length ? items.map((it) => {
-    avgEls[it.id] = h('div', { class: 'item-avg' });
-    return h('div', { class: 'item' },
+  const itemBox = (it, disabled) => {
+    avgEls[it.id] = avgEls[it.id] || h('div', { class: 'item-avg' });
+    return h('div', { class: 'item' + (disabled ? ' off' : '') },
       h('div', { class: 'item-head' }, it.label ? h('span', { class: 'qno' }, it.label) : null, h('span', null, fieldName[it.fieldId] || '')),
-      h('div', { class: 'item-body' }, scoreInput(it), h('span', { class: 'max' }, `/${fmt(it.max)}`)),
+      h('div', { class: 'item-body' }, scoreInput(it, disabled), h('span', { class: 'max' }, `/${fmt(it.max)}`)),
       avgEls[it.id]);
-  }) : h('p', { class: 'muted small' }, 'このテストにはまだ問題がありません。'));
+  };
+  // ---- 選択問題: 大問ごとに「選択する」チェック。選べる数に達したら他は選べない
+  const groupDefs = test.choiceGroups || [];
+  function choiceGroupView(g) {
+    const box = h('div', { class: 'choice-group' });
+    const gItems = items.filter((it) => it.cg === `${testId}:${g.id}`);
+    const blocks = [];
+    for (const it of gItems) { let b = blocks.find((x) => x.key === it.block); if (!b) blocks.push((b = { key: it.block, items: [] })); b.items.push(it); }
+    const pick = Math.min(Number(g.pick) || 1, blocks.length);
+    const selected = () => {
+      const set = new Set((st.choices[g.id] || []).filter((k) => blocks.some((b) => b.key === k)));
+      for (const b of blocks) if (b.items.some((it) => validScore(it, st.scores) !== null)) set.add(b.key);
+      return set;
+    };
+    function draw() {
+      const sel = selected();
+      fill(box,
+        h('div', { class: 'row' }, h('b', null, g.name || '選択問題'),
+          h('span', { class: 'pill accent' }, `${blocks.length}つの大問から${pick}つ選択`),
+          h('span', { class: 'small ' + (sel.size === pick ? 'ok' : 'muted') }, `選択中 ${sel.size} / ${pick}`)),
+        blocks.map((b) => {
+          const on = sel.has(b.key);
+          const cb = h('input', { type: 'checkbox', checked: on, disabled: !canScores || (!on && sel.size >= pick), 'aria-label': `${blockName(b.key)}を選択` });
+          cb.addEventListener('change', () => {
+            const cur = selected();
+            if (cb.checked) { if (cur.size >= pick) { cb.checked = false; return; } cur.add(b.key); }
+            else {
+              cur.delete(b.key);
+              let cleared = false;
+              for (const it of b.items) if (it.id in st.scores) { delete st.scores[it.id]; cleared = true; }
+              if (cleared) toast(`${blockName(b.key)}の点数を消しました`);
+            }
+            st.choices[g.id] = [...cur];
+            draw(); recompute(); queueScores();
+          });
+          const bMax = b.items.reduce((a, it) => a + it.max, 0);
+          return h('div', { class: 'choice-block' + (on ? '' : ' off') },
+            h('label', { class: 'row small choice-head' }, cb, h('b', null, blockName(b.key)), h('span', { class: 'muted' }, `（${fmt(bMax)}点）`), on ? h('span', { class: 'pill good' }, '選択') : null),
+            h('div', { class: 'items qgrid' }, b.items.map((it) => itemBox(it, !on))));
+        }));
+    }
+    draw();
+    return box;
+  }
+  const requiredItems = items.filter((it) => !it.cg);
+  const questionGrid = h('div', { class: 'stack', style: 'gap:12px' },
+    !items.length ? h('p', { class: 'muted small' }, 'このテストにはまだ問題がありません。') : null,
+    requiredItems.length ? h('div', { class: 'items qgrid' }, requiredItems.map((it) => itemBox(it, false))) : null,
+    groupDefs.filter((g) => items.some((it) => it.cg === `${testId}:${g.id}`)).map(choiceGroupView));
   const totalEl = h('div', { class: 'subtotal big-total' });
 
   // ---- 目標・メモ
@@ -1071,7 +1130,7 @@ async function duplicateTest(t, all) {
   try {
     const ref = await addDoc(collection(db, 'tests'), {
       title: nextTitle(t.title, all.map((x) => x.title)).slice(0, 60), description: t.description || '', category: catOf(t), published: false,
-      questions: (t.questions || []).map((q) => ({ ...q })), createdAt: Date.now(), updatedAt: Date.now(),
+      questions: (t.questions || []).map((q) => ({ ...q })), choiceGroups: (t.choiceGroups || []).map((g) => ({ ...g })), createdAt: Date.now(), updatedAt: Date.now(),
     });
     toast('複製しました（非公開で作成しています）');
     location.hash = `#/t/test/${ref.id}/edit`;
@@ -1121,7 +1180,7 @@ async function viewTestEditor(testId) {
   const snap = await getDoc(doc(db, 'tests', testId));
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const orig = { id: testId, ...snap.data() };
-  const t = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, questions: (orig.questions || []).map((q) => ({ ...q })) };
+  const t = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, questions: (orig.questions || []).map((q) => ({ ...q })), choiceGroups: (orig.choiceGroups || []).map((g) => ({ ...g })) };
   let fields = await loadFields(t.category);
   let dirty = false;
   const statusEl = h('span', { class: 'small muted' });
@@ -1132,7 +1191,33 @@ async function viewTestEditor(testId) {
 
   const box = h('div', { class: 'stack' });
   const totalEl = h('span', { class: 'small muted' });
-  const renderTotal = () => { totalEl.textContent = `問題 ${t.questions.length}問 ・ 満点 ${fmt(t.questions.reduce((a, q) => a + (Number(q.max) || 0), 0))}点`; };
+  const draft = () => ({ id: testId, choiceGroups: t.choiceGroups, questions: t.questions.map((q) => ({ ...q, max: Number(q.max) || 0 })) });
+  const renderTotal = () => {
+    totalEl.textContent = `問題 ${t.questions.length}問 ・ 満点 ${fmt(testMax(draft()))}点${t.choiceGroups.length ? '（選択問題は選ぶ数のぶん）' : ''}`;
+    renderGroupInfo();
+  };
+  // 選択グループに入っている大問の一覧（問題番号の先頭で自動的にまとまる）
+  const groupInfoEls = {};
+  const blocksIn = (g) => {
+    const out = [];
+    for (const q of t.questions.filter((x) => x.choiceGroup === g.id)) {
+      const k = blockOf(q); let b = out.find((x) => x.key === k);
+      if (!b) out.push((b = { key: k, max: 0, labels: [] }));
+      b.max += Number(q.max) || 0; b.labels.push(q.label || '?');
+    }
+    return out;
+  };
+  function renderGroupInfo() {
+    for (const g of t.choiceGroups) {
+      const el = groupInfoEls[g.id]; if (!el) continue;
+      const bl = blocksIn(g);
+      const maxes = [...new Set(bl.map((b) => b.max))];
+      fill(el, !bl.length ? h('span', { class: 'err' }, 'まだ問題が割り当てられていません。下の問題の「必答/選択」で選んでください。')
+        : [h('span', null, `大問 ${bl.map((b) => `${blockName(b.key)}（${b.labels.join(', ')}）`).join('、')} の${bl.length}つから${g.pick}つ選択`),
+          Number(g.pick) >= bl.length ? h('span', { class: 'err' }, ' ・ 選ぶ数が大問の数以上です') : null,
+          maxes.length > 1 ? h('span', { class: 'err' }, ` ・ 大問ごとの満点が違います（${maxes.join(', ')}点）。満点の大きい順に数えます`) : h('span', { class: 'muted' }, ` ・ 大問1つ ${fmt(maxes[0])}点`)]);
+    }
+  }
   const textIn = (obj, key, attrs = {}) => {
     const el = h('input', { type: 'text', value: obj[key] ?? '', ...attrs });
     el.addEventListener('input', () => { obj[key] = el.value; markDirty(); });
@@ -1156,12 +1241,21 @@ async function viewTestEditor(testId) {
       return sel;
     };
     const move = (i, d) => { const j = i + d; if (j < 0 || j >= t.questions.length) return; [t.questions[i], t.questions[j]] = [t.questions[j], t.questions[i]]; markDirty(); render(); };
+    const choiceSelect = (q) => {
+      const sel = h('select', { 'aria-label': '必答/選択' }, h('option', { value: '' }, '必答'),
+        t.choiceGroups.map((g) => h('option', { value: g.id, selected: q.choiceGroup === g.id }, `選択: ${g.name || '選択問題'}`)));
+      sel.addEventListener('change', () => { q.choiceGroup = sel.value || null; markDirty(); renderTotal(); });
+      return sel;
+    };
     const rows = t.questions.map((q, i) => {
       const maxIn = h('input', { type: 'number', min: 1, step: 'any', value: q.max ?? '', 'aria-label': '配点' });
       maxIn.addEventListener('input', () => { q.max = maxIn.value === '' ? null : Number(maxIn.value); markDirty(); renderTotal(); });
-      return h('div', { class: 'ed-item ed-q' },
-        textIn(q, 'label', { maxlength: 10, placeholder: '1-1', 'aria-label': '問題番号' }),
+      const labelIn = textIn(q, 'label', { maxlength: 10, placeholder: '1-1', 'aria-label': '問題番号' });
+      labelIn.addEventListener('input', renderGroupInfo);
+      return h('div', { class: 'ed-item ed-q' + (t.choiceGroups.length ? ' with-choice' : '') },
+        labelIn,
         fieldSelect(q), maxIn,
+        t.choiceGroups.length ? choiceSelect(q) : null,
         h('span', { class: 'row', style: 'flex-wrap:nowrap;gap:4px' },
           h('button', { class: 'btn small', type: 'button', onclick: () => move(i, -1), 'aria-label': '上へ' }, '↑'),
           h('button', { class: 'btn small', type: 'button', onclick: () => move(i, 1), 'aria-label': '下へ' }, '↓'),
@@ -1169,7 +1263,7 @@ async function viewTestEditor(testId) {
     });
     const addQ = () => {
       const last = t.questions[t.questions.length - 1];
-      t.questions.push({ id: rid('q_'), label: last ? nextLabel(last.label) : '1', fieldId: last ? last.fieldId : null, max: last ? last.max : 10 });
+      t.questions.push({ id: rid('q_'), label: last ? nextLabel(last.label) : '1', fieldId: last ? last.fieldId : null, max: last ? last.max : 10, choiceGroup: last ? last.choiceGroup || null : null });
       markDirty(); render();
       const ins = box.querySelectorAll('.ed-q input[aria-label="問題番号"]');
       ins[ins.length - 1]?.focus();
@@ -1185,9 +1279,26 @@ async function viewTestEditor(testId) {
         h('p', { class: 'small muted' }, `分野は「${CAT_SHORT[t.category]}」タブ共通の分野リストから選びます（得点表の管理画面で追加できます）。`),
         !fields.length ? h('p', { class: 'notice small' }, '分野がまだありません。得点表の管理画面の「分野」で先に追加すると、ここで選べるようになります。') : null,
         h('div', { class: 'ed-items' },
-          h('div', { class: 'ed-item ed-q label' }, h('span', null, '問題番号'), h('span', null, '分野'), h('span', null, '配点'), h('span')),
+          h('div', { class: 'ed-item ed-q label' + (t.choiceGroups.length ? ' with-choice' : '') }, h('span', null, '問題番号'), h('span', null, '分野'), h('span', null, '配点'), t.choiceGroups.length ? h('span', null, '必答/選択') : null, h('span')),
           rows),
-        h('div', null, h('button', { class: 'btn small', type: 'button', onclick: addQ }, '＋ 問題を追加'))));
+        h('div', null, h('button', { class: 'btn small', type: 'button', onclick: addQ }, '＋ 問題を追加'))),
+      h('div', { class: 'card' },
+        h('h2', null, '選択問題'),
+        h('p', { class: 'small muted' }, '「第4問〜第7問から3問選択」のような問題があるときに使います。グループを作り、上の問題の「必答/選択」でグループを選びます。問題番号の先頭（4-1、4-2 → 第4問）で大問にまとまります。生徒は大問ごとに選んで記入し、満点は選ぶ数のぶんだけ数えます。'),
+        t.choiceGroups.map((g, gi) => {
+          const nameIn = textIn(g, 'name', { maxlength: 30, placeholder: '例: 第4問〜第7問', 'aria-label': '選択グループの名前' });
+          nameIn.addEventListener('input', () => {
+            for (const o of box.querySelectorAll(`select[aria-label="必答/選択"] option[value="${g.id}"]`)) o.textContent = `選択: ${g.name || '選択問題'}`;
+          });
+          const pickIn = h('input', { type: 'number', min: 1, step: 1, value: g.pick ?? 1, 'aria-label': '選ぶ数', style: 'width:5em' });
+          pickIn.addEventListener('input', () => { g.pick = Math.max(1, parseInt(pickIn.value, 10) || 1); markDirty(); renderTotal(); });
+          groupInfoEls[g.id] = h('div', { class: 'small' });
+          return h('div', { class: 'choice-ed' },
+            h('div', { class: 'row' }, nameIn, h('span', { class: 'small' }, 'から'), pickIn, h('span', { class: 'small' }, 'つ選択'), h('span', { class: 'spacer' }),
+              h('button', { class: 'btn small danger', type: 'button', onclick: () => { t.choiceGroups.splice(gi, 1); for (const q of t.questions) if (q.choiceGroup === g.id) q.choiceGroup = null; markDirty(); render(); } }, 'グループを削除')),
+            groupInfoEls[g.id]);
+        }),
+        h('div', null, h('button', { class: 'btn small', type: 'button', onclick: () => { t.choiceGroups.push({ id: rid('g_'), name: '', pick: 1 }); markDirty(); render(); } }, '＋ 選択グループを追加'))));
     renderTotal();
   }
 
@@ -1195,12 +1306,18 @@ async function viewTestEditor(testId) {
     const problems = [];
     if (!t.title.trim()) problems.push('テストの名前を入力してください。');
     if (t.questions.some((q) => !(Number(q.max) > 0))) problems.push('配点が空または0以下の問題があります。');
+    for (const g of t.choiceGroups) {
+      const n = blocksIn(g).length;
+      if (!n) problems.push(`選択グループ「${g.name || '選択問題'}」に問題がありません。`);
+      else if (!(Number(g.pick) >= 1 && Number(g.pick) < n)) problems.push(`選択グループ「${g.name || '選択問題'}」の選ぶ数は1〜${n - 1}にしてください。`);
+    }
     if (problems.length) { statusEl.className = 'small err'; statusEl.textContent = problems.join(' '); return; }
     saveBtn.disabled = true;
     try {
       await updateDoc(doc(db, 'tests', testId), {
         title: t.title.trim(), description: t.description.trim(), category: t.category, published: t.published,
-        questions: t.questions.map((q) => ({ id: q.id, label: (q.label || '').trim(), fieldId: q.fieldId || null, max: Number(q.max) })),
+        questions: t.questions.map((q) => ({ id: q.id, label: (q.label || '').trim(), fieldId: q.fieldId || null, max: Number(q.max), choiceGroup: t.choiceGroups.some((g) => g.id === q.choiceGroup) ? q.choiceGroup : null })),
+        choiceGroups: t.choiceGroups.map((g) => ({ id: g.id, name: (g.name || '').trim(), pick: Number(g.pick) || 1 })),
         updatedAt: Date.now(),
       });
       dirty = false; statusEl.className = 'small ok'; statusEl.textContent = '保存しました'; toast('保存しました');
@@ -1332,7 +1449,7 @@ async function viewResults(kind, id) {
   const distBox = h('div');
 
   function columns() {
-    if (st.mode === 'questions') return items.map((it) => ({ label: `${it.label || '問'}`, sub: fields.find((f) => f.id === it.fieldId)?.name || '', items: [it], kind: 'pt' }));
+    if (st.mode === 'questions') return items.map((it) => ({ label: `${it.label || '問'}${it.cg ? '（選択）' : ''}`, sub: fields.find((f) => f.id === it.fieldId)?.name || '', items: [it], kind: 'pt' }));
     if (st.mode === 'tests') return members.map((t) => ({ label: t.title, sub: `/${fmt(testMax(t))}`, items: items.filter((it) => it.testId === t.id), kind: 'complete' }));
     const cols = fields.map((f) => ({ label: f.name, items: items.filter((it) => it.fieldId === f.id), kind: 'rate' })).filter((c) => c.items.length);
     return cols.map((c) => ({ ...c, sub: `満点${fmt(c.items.reduce((a, it) => a + it.max, 0))}` }));
