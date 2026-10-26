@@ -30,20 +30,21 @@ jobs:
           printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
 
-      - name: Hosting（サイト本体）をデプロイ
+      # 既存のデータは削除・上書きしない。変換が必要なときだけ、先に Firestore 内へバックアップを取る。
+      # 失敗したらここで止まり、新しいアプリとルールは公開されない（今のアプリがそのまま動き続ける）。
+      - name: データのバックアップと変換
+        id: migrate
         if: env.GOOGLE_APPLICATION_CREDENTIALS != ''
+        working-directory: scripts
         run: |
-          set -o pipefail
-          npx --yes firebase-tools@13 deploy --only hosting --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/hosting.log" || {
-            tail -n 25 "$RUNNER_TEMP/hosting.log" | sed 's/^/::error title=Hosting のデプロイに失敗::/'
-            exit 1
-          }
+          npm ci --no-audit --no-fund
+          node migrate-classes.js || { echo "::error title=データの変換に失敗::デプロイを中止しました。データは変更されていないか、バックアップが backups コレクションにあります。"; exit 1; }
 
-      - name: Firestore ルールをデプロイ
-        if: always() && env.GOOGLE_APPLICATION_CREDENTIALS != ''
+      - name: Hosting（サイト本体）と Firestore ルールをデプロイ
+        if: env.GOOGLE_APPLICATION_CREDENTIALS != '' && steps.migrate.outcome == 'success'
         run: |
           set -o pipefail
-          npx --yes firebase-tools@13 deploy --only firestore:rules --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/firestore.log" || {
-            tail -n 25 "$RUNNER_TEMP/firestore.log" | sed 's/^/::error title=Firestore ルールのデプロイに失敗::/'
+          npx --yes firebase-tools@13 deploy --only hosting,firestore:rules --project point-check-9ca84 --non-interactive 2>&1 | tee "$RUNNER_TEMP/deploy.log" || {
+            tail -n 25 "$RUNNER_TEMP/deploy.log" | sed 's/^/::error title=デプロイに失敗::/'
             exit 1
           }

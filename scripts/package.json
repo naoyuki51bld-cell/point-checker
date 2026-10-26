@@ -1,0 +1,9 @@
+{
+  "name": "point-checker-scripts",
+  "private": true,
+  "description": "デプロイ時に GitHub Actions から実行する管理用スクリプト",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "firebase-admin": "12.7.0"
+  }
+}

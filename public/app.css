@@ -280,3 +280,7 @@ tr.avg-row td.sticky { background: var(--accent-soft); }
 .pw-list td { font-family: var(--f-num); }
 
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } .wb-card:hover { transform: none; } }
+
+/* チェックボックス付きの選択肢（クラス・先生） */
+.chk { border: 1px solid var(--line); border-radius: 10px; padding: 6px 12px; gap: 8px; cursor: pointer; background: var(--card); }
+.chk:has(input:checked) { border-color: var(--navy-2); background: var(--accent-soft); }

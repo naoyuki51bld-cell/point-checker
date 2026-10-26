@@ -5,8 +5,10 @@ rules_version = '2';
 // - config/teachers    : 先生として登録できるメールアドレスの一覧（先生だけが読み書き）
 // - config/settings    : 生徒の自己登録を受け付けるか（だれでも読める・先生だけが書ける）
 // - fieldLists/{cat}   : タブ（kyotsu / other）ごとの分野リスト（先生が編集）
-// - tests/{id}         : テスト1回分の問題（先生が作成。公開中のものだけ生徒が読める）
-// - sets/{id}          : テストのまとまり（先生が作成。公開中のものだけ生徒が読める）
+// - classes/{id}       : クラス（先生 teacherIds・生徒 studentIds）。生徒は自分のクラスだけ読める
+// - tests/{id}         : テスト1回分の問題（先生が作成。visibleTo = 公開中の配信先クラス。そのクラスの生徒だけ読める）
+// - sets/{id}          : テストのまとまり（tests と同じ）
+// - backups/{id}       : デプロイ時の自動バックアップ（アプリからは誰も読み書きできない。ルールを書かないことで拒否）
 // - scores/{test_uid}  : 生徒の点数（平均・順位・分布の計算のため、ログイン済みなら読める。名前は含まない）
 // - notes/{test_uid}   : テストごとの目標点・振り返りメモ（本人と先生だけ）
 // - goals/{uid}        : 共通テストの目標点（100点満点あたり。本人と先生だけ）
@@ -24,11 +26,15 @@ service cloud.firestore {
     function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
     function isTeacher() { return hasProfile() && get(userPath(request.auth.uid)).data.role == 'teacher'; }
     function isStudent() { return hasProfile() && get(userPath(request.auth.uid)).data.role == 'student'; }
+    function myClassIds() { return get(userPath(request.auth.uid)).data.get('classIds', []); }
+    // 生徒にそのテスト（セット）が見えるか: 公開中の配信先クラスに自分のクラスが含まれる
+    function visibleToMe(data) { return hasProfile() && data.get('visibleTo', []).hasAny(myClassIds()); }
 
     function validName(d) { return d.displayName is string && d.displayName.size() > 0 && d.displayName.size() <= 40; }
     function validStudent(d) {
-      return d.keys().hasOnly(['studentNo', 'displayName', 'role', 'mustChangePassword', 'createdAt'])
-        && d.role == 'student' && d.studentNo is string && d.studentNo.matches('^[0-9]{4}$') && validName(d);
+      return d.keys().hasOnly(['studentNo', 'displayName', 'role', 'mustChangePassword', 'createdAt', 'classIds'])
+        && d.role == 'student' && d.studentNo is string && d.studentNo.matches('^[0-9]{4}$') && validName(d)
+        && d.get('classIds', []) is list;
     }
     function validTeacher(d) {
       return d.keys().hasOnly(['email', 'displayName', 'role', 'mustChangePassword', 'createdAt'])
@@ -60,6 +66,7 @@ service cloud.firestore {
         (signedIn() && request.auth.uid == uid && validStudent(request.resource.data)
           && request.auth.token.email == 's' + request.resource.data.studentNo + '@' + studentEmailDomain()
           && request.resource.data.mustChangePassword == false
+          && request.resource.data.get('classIds', []).size() == 0
           && selfSignupOpen())
         // 先生の登録（確認済みのメールアドレスが許可リストにある場合だけ）
         || (signedIn() && request.auth.uid == uid && validTeacher(request.resource.data)
@@ -86,13 +93,18 @@ service cloud.firestore {
       allow write: if isTeacher() && cat in ['kyotsu', 'other'];
     }
 
+    match /classes/{classId} {
+      allow read: if isTeacher() || (signedIn() && resource.data.get('studentIds', []).hasAny([request.auth.uid]));
+      allow write: if isTeacher();
+    }
+
     match /tests/{testId} {
-      allow read: if isTeacher() || (hasProfile() && resource.data.published == true);
+      allow read: if isTeacher() || visibleToMe(resource.data);
       allow write: if isTeacher();
     }
 
     match /sets/{setId} {
-      allow read: if isTeacher() || (hasProfile() && resource.data.published == true);
+      allow read: if isTeacher() || visibleToMe(resource.data);
       allow write: if isTeacher();
     }
 
@@ -109,7 +121,7 @@ service cloud.firestore {
           && docId == request.resource.data.testId + '_' + request.auth.uid
           && request.resource.data.keys().hasOnly(['testId', 'uid', 'scores', 'choices', 'date', 'updatedAt'])
           && request.resource.data.scores is map
-          && exists(/databases/$(database)/documents/tests/$(request.resource.data.testId))
+          && visibleToMe(get(/databases/$(database)/documents/tests/$(request.resource.data.testId)).data)
         ) || (
           // 先生による点数の記入・修正（生徒のアカウントに対してだけ）
           isTeacher()

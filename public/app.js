@@ -6,7 +6,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, connectFirestoreEmulator, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc,
-  collection, query, where, onSnapshot, writeBatch,
+  collection, query, where, onSnapshot, writeBatch, arrayUnion, arrayRemove,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getFunctions, httpsCallable, connectFunctionsEmulator } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
 import { firebaseConfig, appConfig } from './firebase-config.js';
@@ -153,6 +153,7 @@ function renderNav() {
   const link = (href, text) => h('a', { href, class: (href === '#/' ? cur === '#/' || cur === '' : cur.startsWith(href)) ? 'active' : '' }, text);
   fill(nav, ...[
     link('#/', '得点表'),
+    isTeacher() ? link('#/t/classes', 'クラス') : null,
     isTeacher() ? link('#/t/users', '生徒・アカウント') : null,
     link('#/account', 'パスワード変更'),
     h('span', { class: 'who' }, `${S.profile.displayName}（${isTeacher() ? '先生' : '生徒'}）`),
@@ -187,6 +188,8 @@ async function renderRoute() {
     if (isTeacher()) {
       const [t0, kind, id, sub, uid, sub2] = parts;
       if (t0 === 't' && kind === 'users') return await viewUsers();
+      if (t0 === 't' && kind === 'classes') return await viewClasses();
+      if (t0 === 't' && kind === 'class' && id) return await viewClassEditor(id);
       if (t0 === 't' && (kind === 'test' || kind === 'set') && id) {
         if (sub === 'edit') return kind === 'test' ? await viewTestEditor(id) : await viewSetEditor(id);
         if (sub === 'results') return await viewResults(kind, id);
@@ -333,7 +336,7 @@ async function viewStudentRegister() {
     S.busy = true;
     try {
       const cred = await createUserWithEmailAndPassword(auth, studentEmail(no), form.querySelector('#rg-pass').value);
-      const profile = { studentNo: no, displayName: name.slice(0, 40), role: 'student', mustChangePassword: false, createdAt: Date.now() };
+      const profile = { studentNo: no, displayName: name.slice(0, 40), role: 'student', mustChangePassword: false, createdAt: Date.now(), classIds: [] };
       try { await setDoc(doc(db, 'users', cred.user.uid), profile); }
       catch (e) { await cred.user.delete().catch(() => {}); throw Object.assign(new Error(), { code: e.code === 'permission-denied' ? 'closed' : e.code }); }
       S.user = cred.user;
@@ -503,10 +506,41 @@ async function loadFields(cat) {
   const s = await getDoc(doc(db, 'fieldLists', cat));
   return s.exists() && Array.isArray(s.data().fields) ? s.data().fields : [];
 }
-// 先生はすべて、生徒は公開中のものだけ読める（ルールに合わせたクエリにする）
+// 先生はすべて、生徒は自分のクラスに公開中のもの（visibleTo）だけ読める（ルールに合わせたクエリにする）
 async function loadAll(col) {
-  const q = isTeacher() ? collection(db, col) : query(collection(db, col), where('published', '==', true));
-  return docsOf(await getDocs(q)).sort(byTitle);
+  if (isTeacher()) return docsOf(await getDocs(collection(db, col))).sort(byTitle);
+  const mine = (S.profile.classIds || []).slice(0, 30);
+  if (!mine.length) return [];
+  return docsOf(await getDocs(query(collection(db, col), where('visibleTo', 'array-contains-any', mine)))).sort(byTitle);
+}
+
+// ---- クラス
+const byName = (a, b) => (a.name || '').localeCompare(b.name || '', 'ja', { numeric: true });
+// 先生はすべてのクラス、生徒は自分が入っているクラスだけ読める
+async function loadClasses() {
+  const q = isTeacher() ? collection(db, 'classes') : query(collection(db, 'classes'), where('studentIds', 'array-contains', S.user.uid));
+  return docsOf(await getDocs(q)).sort(byName);
+}
+const myTeachingIds = (classes) => classes.filter((c) => (c.teacherIds || []).includes(S.user.uid)).map((c) => c.id);
+// 生徒に見せる配信先（公開中のときだけ）
+const visibleFor = (published, classIds) => (published ? [...(classIds || [])] : []);
+// 平均・順位・分布で比べる相手: 配信先クラスのうち、その生徒が入っているクラスの生徒（生徒が不明なら配信先全員）
+function peersOf(obj, studentClassIds, classes) {
+  const target = obj.classIds || [];
+  let ids = studentClassIds ? target.filter((c) => studentClassIds.includes(c)) : target;
+  if (!ids.length) ids = target;
+  const set = new Set();
+  for (const c of classes) if (ids.includes(c.id)) for (const u of c.studentIds || []) set.add(u);
+  return set;
+}
+const classNames = (ids, classes) => (ids || []).map((id) => classes.find((c) => c.id === id)?.name).filter(Boolean);
+function classPicker(classes, selected, onChange) {
+  if (!classes.length) return h('p', { class: 'notice small' }, 'クラスがまだありません。上の「クラス」から作ってください。');
+  return h('div', { class: 'row' }, classes.map((c) => {
+    const cb = h('input', { type: 'checkbox', checked: selected.includes(c.id) });
+    cb.addEventListener('change', () => onChange(cb.checked ? [...new Set([...selected, c.id])] : selected.filter((x) => x !== c.id)));
+    return h('label', { class: 'row chk' }, cb, c.name, h('span', { class: 'small muted' }, `${(c.studentIds || []).length}人`));
+  }));
 }
 
 // セットに含まれる問題を「テストID:問題ID」で1つの並びにする
@@ -645,6 +679,9 @@ function goalInput(uid, goal, onChange) {
 // ---------------------------------------------------------------- student home
 async function viewStudentHome() {
   const uid = S.user.uid;
+  // 先生がクラスを変えたときに備えて、プロフィール（所属クラス）を読み直す
+  const prof = await getDoc(doc(db, 'users', uid));
+  if (prof.exists()) S.profile = prof.data();
   const [tests, sets, mySnap, goalSnap] = await Promise.all([
     loadAll('tests'), loadAll('sets'),
     getDocs(query(collection(db, 'scores'), where('uid', '==', uid))),
@@ -703,6 +740,7 @@ async function viewStudentHome() {
 
   mount(
     pageHead(`出席番号 ${S.profile.studentNo}　${S.profile.displayName}`, '自分の得点表'),
+    !(S.profile.classIds || []).length ? h('p', { class: 'notice warn' }, 'まだクラスに登録されていません。先生にクラスへの登録を頼んでください。登録されると、そのクラスのテストが表示されます。') : null,
     catTabs(cat, counts, (k) => { cat = k; render(); }),
     body);
   render();
@@ -724,9 +762,10 @@ async function viewTest(testId, uid, mode) {
   const max = testMax(test);
   const scoreRef = doc(db, 'scores', `${testId}_${uid}`);
   const noteRef = doc(db, 'notes', `${testId}_${uid}`);
-  const [fields, sets, sSnap, nSnap, gSnap, pSnap] = await Promise.all([
+  const [fields, sets, classes, sSnap, nSnap, gSnap, pSnap] = await Promise.all([
     loadFields(catOf(test)),
     loadAll('sets'),
+    loadClasses(),
     isPreview ? null : getDoc(scoreRef),
     isPreview ? null : getDoc(noteRef),
     isPreview || !kyotsu ? null : getDoc(doc(db, 'goals', uid)),
@@ -744,6 +783,7 @@ async function viewTest(testId, uid, mode) {
   };
   const fieldName = Object.fromEntries(fields.map((f) => [f.id, f.name]));
   const inSets = sets.filter((s) => (s.testIds || []).includes(testId));
+  const peers = peersOf(test, isPreview ? null : (who.classIds || []), classes);
 
   // ---- 保存
   const saveEl = h('span', { class: 'save-state muted' },
@@ -932,6 +972,7 @@ async function viewTest(testId, uid, mode) {
     for (const d of snap.docs) {
       const x = d.data();
       if (x.uid === uid) { if (mode === 'teacher-view') { st.scores = { ...(x.scores || {}) }; st.date = x.date || ''; } continue; }
+      if (!peers.has(x.uid)) continue;
       others[x.uid] = x.scores || {};
     }
     st.others = others;
@@ -965,8 +1006,8 @@ async function viewSet(setId, uid, mode) {
   const set = { id: setId, ...sSnap.data() };
   const kyotsu = isKyotsu(set);
   const teacherMode = mode === 'teacher-view';
-  const [fields, tests, gSnap, pSnap] = await Promise.all([
-    loadFields(catOf(set)), loadAll('tests'),
+  const [fields, tests, classes, gSnap, pSnap] = await Promise.all([
+    loadFields(catOf(set)), loadAll('tests'), loadClasses(),
     kyotsu ? getDoc(doc(db, 'goals', uid)) : null,
     teacherMode ? getDoc(doc(db, 'users', uid)) : null,
   ]);
@@ -975,6 +1016,9 @@ async function viewSet(setId, uid, mode) {
   const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
   const members = (set.testIds || []).map((id) => testsById[id]).filter(Boolean);
   const items = setItems(set, testsById);
+  const peers = peersOf(set, who.classIds || [], classes);
+  peers.add(uid);
+  const onlyPeers = (scoresByUid) => Object.fromEntries(Object.entries(scoresByUid || {}).filter(([u]) => peers.has(u)));
 
   const T = {};
   const tile = (key, label) => { T[key] = h('span', { class: 'v' }); return h('div', { class: 'tile' }, h('span', { class: 'label' }, label), T[key]); };
@@ -983,7 +1027,8 @@ async function viewSet(setId, uid, mode) {
   const fieldsBox = h('div');
   const distBox = h('div');
 
-  function render(byTest, meta) {
+  function render(rawByTest, meta) {
+    const byTest = Object.fromEntries(Object.entries(rawByTest).map(([t, m]) => [t, onlyPeers(m)]));
     const all = mergeScores(members.map((t) => t.id), byTest);
     const my = all[uid] || {};
     const me = evalGroup(items, my);
@@ -1037,21 +1082,33 @@ async function viewSet(setId, uid, mode) {
 
 // ---------------------------------------------------------------- teacher: home
 async function viewTeacherHome() {
-  const [tests, sets, oldWbs] = await Promise.all([
-    loadAll('tests'), loadAll('sets'),
+  const [tests, sets, classes, oldWbs] = await Promise.all([
+    loadAll('tests'), loadAll('sets'), loadClasses(),
     getDocs(collection(db, 'workbooks')).then(docsOf).catch(() => []),
   ]);
   const legacy = oldWbs.filter((w) => !w.migratedAt);
   let cat = loadCat();
-  const counts = { kyotsu: tests.filter(isKyotsu).length, other: tests.filter((t) => !isKyotsu(t)).length };
+  const mine = myTeachingIds(classes);
+  // 表示するクラス: 担当クラス（mine）／すべて（all）／クラスID／配信先なし（none）
+  let clsFilter = (() => { try { return localStorage.getItem('clsFilter') || ''; } catch (e) { return ''; } })();
+  if (!clsFilter || (!['mine', 'all', 'none'].includes(clsFilter) && !classes.some((c) => c.id === clsFilter)) || (clsFilter === 'mine' && !mine.length)) clsFilter = mine.length ? 'mine' : 'all';
+  const matches = (x) => {
+    const ids = x.classIds || [];
+    if (clsFilter === 'all') return true;
+    if (clsFilter === 'none') return !ids.length;
+    if (clsFilter === 'mine') return ids.some((c) => mine.includes(c));
+    return ids.includes(clsFilter);
+  };
+  const newClassIds = () => (clsFilter === 'mine' ? [...mine] : ['all', 'none'].includes(clsFilter) ? [] : [clsFilter]);
   const body = h('div', { class: 'stack' });
+  const tabsBox = h('div');
 
   async function createTest(title) {
-    const ref = await addDoc(collection(db, 'tests'), { title, description: '', category: cat, published: false, questions: [], createdAt: Date.now(), updatedAt: Date.now() });
+    const ref = await addDoc(collection(db, 'tests'), { title, description: '', category: cat, published: false, classIds: newClassIds(), visibleTo: [], questions: [], createdAt: Date.now(), updatedAt: Date.now() });
     location.hash = `#/t/test/${ref.id}/edit`;
   }
   async function createSet(title) {
-    const ref = await addDoc(collection(db, 'sets'), { title, description: '', category: cat, published: false, testIds: [], createdAt: Date.now(), updatedAt: Date.now() });
+    const ref = await addDoc(collection(db, 'sets'), { title, description: '', category: cat, published: false, classIds: newClassIds(), visibleTo: [], testIds: [], createdAt: Date.now(), updatedAt: Date.now() });
     location.hash = `#/t/set/${ref.id}/edit`;
   }
   const createRow = (placeholder, label, fn) => {
@@ -1070,18 +1127,27 @@ async function viewTeacherHome() {
     const b = h('button', { class: 'btn small', type: 'button' }, x.published ? '非公開にする' : '生徒に公開する');
     b.onclick = async () => {
       b.disabled = true;
-      try { await updateDoc(doc(db, col, x.id), { published: !x.published, updatedAt: Date.now() }); route(); }
+      if (!x.published && !(x.classIds || []).length) { toast('配信するクラスを選んでから公開してください（「編集」から選べます）'); return; }
+      try { await updateDoc(doc(db, col, x.id), { published: !x.published, visibleTo: visibleFor(!x.published, x.classIds), updatedAt: Date.now() }); route(); }
       catch (e) { toast(errMsg(e)); b.disabled = false; }
     };
     return b;
   };
   const pubPill = (x) => (x.published ? h('span', { class: 'pill good' }, '公開中') : h('span', { class: 'pill warn' }, '非公開（生徒には見えません）'));
 
+  const classCell = (x) => {
+    const names = classNames(x.classIds, classes);
+    return h('td', { class: 'small wrap' }, names.length ? names.join('、') : h('span', { class: 'pill warn' }, 'クラス未選択'));
+  };
   function render() {
-    const ts = tests.filter((t) => catOf(t) === cat);
-    const ss = sets.filter((s) => catOf(s) === cat);
+    const ts = tests.filter((t) => catOf(t) === cat && matches(t));
+    const ss = sets.filter((s) => catOf(s) === cat && matches(s));
     const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
+    const counts = { kyotsu: tests.filter((t) => isKyotsu(t) && matches(t)).length, other: tests.filter((t) => !isKyotsu(t) && matches(t)).length };
+    fill(tabsBox, catTabs(cat, counts, (k) => { cat = k; render(); }));
     fill(body,
+      !classes.length ? h('div', { class: 'card notice warn' }, h('h2', null, 'まずクラスを作りましょう'),
+        h('p', { class: 'small' }, 'テストやセットは、配信するクラスの生徒にだけ表示されます。'), h('div', null, h('a', { class: 'btn primary', href: '#/t/classes' }, 'クラスを作る'))) : null,
       legacy.length ? h('div', { class: 'card notice warn' },
         h('h2', null, '以前の形式の得点表があります'),
         h('p', { class: 'small' }, `${legacy.map((w) => w.title).join('、')} を新しい形式（テスト＋セット）に変換できます。回は1つずつのテストに、得点表の中のセットは「セット」に変換され、記入済みの点数も引き継がれます（目標・メモは引き継がれません）。`),
@@ -1092,7 +1158,7 @@ async function viewTeacherHome() {
         h('p', { class: 'small muted' }, 'テストをまとめたものです（例: 「セット1」＝第1回＋第2回、「数学ⅠA 全体」＝第1回〜第14回）。セットごとに分野別の統計と得点率の分布が出ます。'),
         createRow('例: セット1', 'セットを作る', createSet),
         ss.length ? h('div', { class: 'tscroll' }, h('table', null,
-          h('thead', null, h('tr', null, h('th', null, 'セット'), h('th', null, 'テスト'), h('th', null, '状態'), h('th', null, '操作'))),
+          h('thead', null, h('tr', null, h('th', null, 'セット'), h('th', null, 'テスト'), h('th', null, '配信先'), h('th', null, '状態'), h('th', null, '操作'))),
           h('tbody', null, ss.map((s) => h('tr', null,
             h('td', null, h('b', null, s.title)),
             h('td', { class: 'small wrap' }, (() => {
@@ -1100,6 +1166,7 @@ async function viewTeacherHome() {
               if (!names.length) return h('span', { class: 'muted' }, 'なし');
               return names.length <= 3 ? names.join('、') : `${names.length}件（${names[0]} 〜 ${names[names.length - 1]}）`;
             })()),
+            classCell(s),
             h('td', null, pubPill(s)),
             h('td', { class: 'row', style: 'flex-wrap:nowrap' },
               h('a', { class: 'btn primary small', href: `#/t/set/${s.id}/results` }, '成績'),
@@ -1110,11 +1177,12 @@ async function viewTeacherHome() {
         h('p', { class: 'small muted' }, '1回分のテスト（問題番号・分野・配点）です。「複製」で同じ構成のテストを作れます（名前の数字は自動で次の番号になります）。公開すると生徒が記入できます。'),
         createRow(cat === 'kyotsu' ? '例: 第1回 数学Ⅰ・A' : '例: 二次対策 数学 演習1', 'テストを作る', createTest),
         ts.length ? h('div', { class: 'tscroll' }, h('table', null,
-          h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', { class: 'r' }, '問題数'), h('th', { class: 'r' }, '満点'), h('th', null, '状態'), h('th', null, '操作'))),
+          h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', { class: 'r' }, '問題数'), h('th', { class: 'r' }, '満点'), h('th', null, '配信先'), h('th', null, '状態'), h('th', null, '操作'))),
           h('tbody', null, ts.map((t) => h('tr', null,
             h('td', null, h('b', null, t.title)),
             h('td', { class: 'r num' }, (t.questions || []).length),
             h('td', { class: 'r num' }, fmt(testMax(t))),
+            classCell(t),
             h('td', null, pubPill(t)),
             h('td', { class: 'row', style: 'flex-wrap:nowrap' },
               h('a', { class: 'btn primary small', href: `#/t/test/${t.id}/results` }, '成績'),
@@ -1124,9 +1192,15 @@ async function viewTeacherHome() {
               pubToggle('tests', t))))))) : h('p', { class: 'muted small' }, 'まだテストがありません。')));
   }
 
+  const clsSel = h('select', { id: 'cls-filter', 'aria-label': '表示するクラス' },
+    mine.length ? h('option', { value: 'mine', selected: clsFilter === 'mine' }, '担当クラス') : null,
+    h('option', { value: 'all', selected: clsFilter === 'all' }, 'すべてのクラス'),
+    classes.map((c) => h('option', { value: c.id, selected: clsFilter === c.id }, c.name)),
+    h('option', { value: 'none', selected: clsFilter === 'none' }, 'クラス未選択のもの'));
+  clsSel.onchange = () => { clsFilter = clsSel.value; try { localStorage.setItem('clsFilter', clsFilter); } catch (e) { /* noop */ } render(); };
   mount(
-    pageHead('先生用', '得点表の管理'),
-    catTabs(cat, counts, (k) => { cat = k; render(); }),
+    pageHead('先生用', '得点表の管理', null, h('div', { class: 'row' }, h('label', { class: 'label', for: 'cls-filter' }, '表示するクラス'), clsSel, h('a', { class: 'btn small', href: '#/t/classes' }, 'クラスの管理'))),
+    tabsBox,
     body);
   render();
 }
@@ -1143,6 +1217,7 @@ async function duplicateTest(t, all) {
   try {
     const ref = await addDoc(collection(db, 'tests'), {
       title: nextTitle(t.title, all.map((x) => x.title)).slice(0, 60), description: t.description || '', category: catOf(t), published: false,
+      classIds: [...(t.classIds || [])], visibleTo: [],
       questions: (t.questions || []).map((q) => ({ ...q })), choiceGroups: (t.choiceGroups || []).map((g) => ({ ...g })), createdAt: Date.now(), updatedAt: Date.now(),
     });
     toast('複製しました（非公開で作成しています）');
@@ -1193,8 +1268,9 @@ async function viewTestEditor(testId) {
   const snap = await getDoc(doc(db, 'tests', testId));
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const orig = { id: testId, ...snap.data() };
-  const t = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, questions: (orig.questions || []).map((q) => ({ ...q })), choiceGroups: (orig.choiceGroups || []).map((g) => ({ ...g })) };
+  const t = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, classIds: [...(orig.classIds || [])], questions: (orig.questions || []).map((q) => ({ ...q })), choiceGroups: (orig.choiceGroups || []).map((g) => ({ ...g })) };
   let fields = await loadFields(t.category);
+  const classes = await loadClasses();
   let dirty = false;
   const statusEl = h('span', { class: 'small muted' });
   const markDirty = () => { dirty = true; statusEl.className = 'small err'; statusEl.textContent = '未保存の変更があります'; };
@@ -1243,7 +1319,7 @@ async function viewTestEditor(testId) {
     const catSel = h('select', { id: 'ed-cat' }, CATS.map(([k, label]) => h('option', { value: k, selected: t.category === k }, label)));
     catSel.addEventListener('change', async () => { t.category = catSel.value; fields = await loadFields(t.category); markDirty(); render(); });
     const pub = h('input', { type: 'checkbox', checked: t.published, id: 'ed-pub' });
-    pub.addEventListener('change', () => { t.published = pub.checked; markDirty(); });
+    pub.addEventListener('change', () => { t.published = pub.checked; markDirty(); render(); });
     const desc = h('textarea', { rows: 2, maxlength: 300, id: 'ed-desc', placeholder: '生徒の画面の上に表示されます（任意）' });
     desc.value = t.description;
     desc.addEventListener('input', () => { t.description = desc.value; markDirty(); });
@@ -1286,7 +1362,9 @@ async function viewTestEditor(testId) {
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-title' }, 'テストの名前'), textIn(t, 'title', { id: 'ed-title', maxlength: 60 })),
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-desc' }, '説明'), desc),
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-cat' }, '種類'), catSel),
-        h('label', { class: 'row' }, pub, '生徒に公開する（オンにすると生徒が記入できます）')),
+        h('div', { class: 'field' }, h('span', { class: 'label' }, '配信するクラス'), classPicker(classes, t.classIds, (ids) => { t.classIds = ids; markDirty(); render(); })),
+        h('label', { class: 'row' }, pub, '生徒に公開する（オンにすると、選んだクラスの生徒が記入できます）'),
+        t.published && !t.classIds.length ? h('p', { class: 'err' }, 'クラスを選ばないと、公開しても生徒には表示されません。') : null),
       h('div', { class: 'card' },
         h('div', { class: 'row' }, h('h2', null, '問題'), h('span', { class: 'spacer' }), totalEl),
         h('p', { class: 'small muted' }, `分野は「${CAT_SHORT[t.category]}」タブ共通の分野リストから選びます（得点表の管理画面で追加できます）。`),
@@ -1329,6 +1407,7 @@ async function viewTestEditor(testId) {
     try {
       await updateDoc(doc(db, 'tests', testId), {
         title: t.title.trim(), description: t.description.trim(), category: t.category, published: t.published,
+        classIds: t.classIds, visibleTo: visibleFor(t.published, t.classIds),
         questions: t.questions.map((q) => ({ id: q.id, label: (q.label || '').trim(), fieldId: q.fieldId || null, max: Number(q.max), choiceGroup: t.choiceGroups.some((g) => g.id === q.choiceGroup) ? q.choiceGroup : null })),
         choiceGroups: t.choiceGroups.map((g) => ({ id: g.id, name: (g.name || '').trim(), pick: Number(g.pick) || 1 })),
         updatedAt: Date.now(),
@@ -1367,8 +1446,8 @@ async function viewSetEditor(setId) {
   const snap = await getDoc(doc(db, 'sets', setId));
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const orig = snap.data();
-  const s = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, testIds: [...(orig.testIds || [])] };
-  const tests = await loadAll('tests');
+  const s = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, classIds: [...(orig.classIds || [])], testIds: [...(orig.testIds || [])] };
+  const [tests, classes] = await Promise.all([loadAll('tests'), loadClasses()]);
   const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
   let dirty = false;
   const statusEl = h('span', { class: 'small muted' });
@@ -1385,7 +1464,7 @@ async function viewSetEditor(setId) {
     desc.value = s.description;
     desc.addEventListener('input', () => { s.description = desc.value; markDirty(); });
     const pub = h('input', { type: 'checkbox', checked: s.published, id: 'set-pub' });
-    pub.addEventListener('change', () => { s.published = pub.checked; markDirty(); });
+    pub.addEventListener('change', () => { s.published = pub.checked; markDirty(); render(); });
     const candidates = tests.filter((t) => catOf(t) === s.category && !s.testIds.includes(t.id));
     const move = (i, d) => { const j = i + d; if (j < 0 || j >= s.testIds.length) return; [s.testIds[i], s.testIds[j]] = [s.testIds[j], s.testIds[i]]; markDirty(); render(); };
     fill(box,
@@ -1393,7 +1472,10 @@ async function viewSetEditor(setId) {
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'set-title' }, 'セットの名前'), title),
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'set-desc' }, '説明'), desc),
         h('p', { class: 'small muted' }, `種類: ${CATS.find((c) => c[0] === s.category)[1]}`),
-        h('label', { class: 'row' }, pub, '生徒に公開する')),
+        h('div', { class: 'field' }, h('span', { class: 'label' }, '配信するクラス'), classPicker(classes, s.classIds, (ids) => { s.classIds = ids; markDirty(); render(); })),
+        h('label', { class: 'row' }, pub, '生徒に公開する'),
+        s.published && !s.classIds.length ? h('p', { class: 'err' }, 'クラスを選ばないと、公開しても生徒には表示されません。') : null,
+        h('p', { class: 'small muted' }, 'セットの中のテストも、同じクラスに公開しておく必要があります。')),
       h('div', { class: 'card' },
         h('h2', null, `このセットのテスト（${s.testIds.length}）`),
         s.testIds.length ? h('div', { class: 'stack', style: 'gap:6px' }, s.testIds.map((id, i) => h('div', { class: 'row set-member' },
@@ -1411,7 +1493,7 @@ async function viewSetEditor(setId) {
   async function save() {
     if (!s.title.trim()) { statusEl.className = 'small err'; statusEl.textContent = 'セットの名前を入力してください。'; return; }
     try {
-      await updateDoc(doc(db, 'sets', setId), { title: s.title.trim(), description: s.description.trim(), published: s.published, testIds: s.testIds.filter((id) => testsById[id]), updatedAt: Date.now() });
+      await updateDoc(doc(db, 'sets', setId), { title: s.title.trim(), description: s.description.trim(), published: s.published, classIds: s.classIds, visibleTo: visibleFor(s.published, s.classIds), testIds: s.testIds.filter((id) => testsById[id]), updatedAt: Date.now() });
       dirty = false; statusEl.className = 'small ok'; statusEl.textContent = '保存しました'; toast('保存しました');
     } catch (e) { statusEl.className = 'small err'; statusEl.textContent = errMsg(e); }
   }
@@ -1431,8 +1513,8 @@ async function viewResults(kind, id) {
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const obj = { id, ...snap.data() };
   const kyotsu = isKyotsu(obj);
-  const [fields, tests, uSnap, goalsSnap] = await Promise.all([
-    loadFields(catOf(obj)), kind === 'set' ? loadAll('tests') : Promise.resolve([obj]),
+  const [fields, tests, classes, uSnap, goalsSnap] = await Promise.all([
+    loadFields(catOf(obj)), kind === 'set' ? loadAll('tests') : Promise.resolve([obj]), loadClasses(),
     getDocs(query(collection(db, 'users'), where('role', '==', 'student'))),
     kyotsu ? getDocs(collection(db, 'goals')) : Promise.resolve(null),
   ]);
@@ -1443,8 +1525,20 @@ async function viewResults(kind, id) {
   const goals = goalsSnap ? Object.fromEntries(goalsSnap.docs.map((d) => [d.id, d.data().kyotsu])) : {};
   let notes = {};
   if (kind === 'test') notes = Object.fromEntries((await getDocs(query(collection(db, 'notes'), where('testId', '==', id)))).docs.map((d) => [d.data().uid, d.data()]));
-  const max = items.reduce((a, it) => a + it.max, 0);
-  const st = { mode: kind === 'test' ? 'questions' : 'tests', prefix: '', sort: 'number' };
+  const max = evalGroup(items, {}).max;
+  const targetClasses = classes.filter((c) => (obj.classIds || []).includes(c.id));
+  const mineHere = targetClasses.filter((c) => (c.teacherIds || []).includes(S.user.uid));
+  const st = { mode: kind === 'test' ? 'questions' : 'tests', prefix: '', sort: 'number', cls: mineHere.length === 1 ? mineHere[0].id : targetClasses.length ? 'targets' : 'everyone' };
+  const inClass = (s) => {
+    if (st.cls === 'everyone') return true;
+    const ids = st.cls === 'targets' ? targetClasses.map((c) => c.id) : [st.cls];
+    return classes.some((c) => ids.includes(c.id) && (c.studentIds || []).includes(s.uid));
+  };
+  const clsSel = h('select', { 'aria-label': 'クラス' },
+    targetClasses.map((c) => h('option', { value: c.id, selected: st.cls === c.id }, c.name)),
+    targetClasses.length > 1 ? h('option', { value: 'targets', selected: st.cls === 'targets' }, '配信先のクラスすべて') : null,
+    h('option', { value: 'everyone', selected: st.cls === 'everyone' }, 'すべての生徒'));
+  clsSel.onchange = () => { st.cls = clsSel.value; render(); };
   let byTest = {}, meta = {};
 
   const prefixSel = h('select', { 'aria-label': '出席番号で絞り込み' }, h('option', { value: '' }, 'すべての生徒'), prefixesOf(students).map((p) => h('option', { value: p }, `出席番号 ${p}xx`)));
@@ -1465,13 +1559,13 @@ async function viewResults(kind, id) {
     if (st.mode === 'questions') return items.map((it) => ({ label: `${it.label || '問'}${it.cg ? '（選択）' : ''}`, sub: fields.find((f) => f.id === it.fieldId)?.name || '', items: [it], kind: 'pt' }));
     if (st.mode === 'tests') return members.map((t) => ({ label: t.title, sub: `/${fmt(testMax(t))}`, items: items.filter((it) => it.testId === t.id), kind: 'complete' }));
     const cols = fields.map((f) => ({ label: f.name, items: items.filter((it) => it.fieldId === f.id), kind: 'rate' })).filter((c) => c.items.length);
-    return cols.map((c) => ({ ...c, sub: `満点${fmt(c.items.reduce((a, it) => a + it.max, 0))}` }));
+    return cols.map((c) => ({ ...c, sub: `満点${fmt(evalGroup(c.items, {}).max)}` }));
   }
 
   function render() {
     const all = kind === 'set' ? mergeScores(members.map((t) => t.id), byTest) : (byTest[id] || {});
     const cols = columns();
-    const rows = students.filter((s) => !st.prefix || (s.studentNo || '').startsWith(st.prefix)).map((s) => {
+    const rows = students.filter((s) => inClass(s) && (!st.prefix || (s.studentNo || '').startsWith(st.prefix))).map((s) => {
       const sc = all[s.uid] || {};
       return { s, sc, g: evalGroup(items, sc), cells: cols.map((c) => evalGroup(c.items, sc)) };
     });
@@ -1538,7 +1632,7 @@ async function viewResults(kind, id) {
     head.push(kind === 'test' ? `合計 (/${max})` : `合計（全テスト記入時） (/${max})`, '得点率(%)');
     if (kind === 'test') head.push('目標', '振り返り');
     const lines = [head];
-    for (const s of students.filter((x) => !st.prefix || (x.studentNo || '').startsWith(st.prefix))) {
+    for (const s of students.filter((x) => inClass(x) && (!st.prefix || (x.studentNo || '').startsWith(st.prefix)))) {
       const sc = all[s.uid] || {};
       const row = [s.studentNo || '', s.displayName];
       for (const it of items) { const v = validScore(it, sc); row.push(v === null ? '' : v); }
@@ -1561,7 +1655,7 @@ async function viewResults(kind, id) {
         kind === 'test' ? h('a', { class: 'btn small', href: `#/t/test/${id}/preview` }, '生徒の画面を試す') : null,
         h('button', { class: 'btn small', type: 'button', onclick: exportCsv }, 'CSVでダウンロード'))),
     summary,
-    h('div', { class: 'row' }, h('div', { class: 'tabs', role: 'tablist' }, modeTabs), h('span', { class: 'spacer' }), prefixSel, sortSel),
+    h('div', { class: 'row' }, h('div', { class: 'tabs', role: 'tablist' }, modeTabs), h('span', { class: 'spacer' }), clsSel, prefixSel, sortSel),
     tableBox,
     h('p', { class: 'small muted' }, '名前を押すと、その生徒の記録（目標・振り返りを含む）を見られます。「*」は記入途中です。色: 得点率 70%以上=緑、50〜70%=橙、50%未満=赤。'),
     section(kind === 'test' ? '得点分布' : '得点率の分布', distBox));
@@ -1572,6 +1666,9 @@ async function migrateLegacy(wbs) {
   try {
     toast('変換しています…');
     const fieldCache = {};
+    // 変換したテスト・セットは、自分が担当するクラス（なければすべてのクラス）に配信する
+    const allClasses = await loadClasses();
+    const legacyClassIds = myTeachingIds(allClasses).length ? myTeachingIds(allClasses) : allClasses.map((c) => c.id);
     for (const w of wbs) {
       const cat = catOf(w);
       if (!fieldCache[cat]) fieldCache[cat] = await loadFields(cat);
@@ -1592,15 +1689,16 @@ async function migrateLegacy(wbs) {
         for (const r of s.rounds || []) {
           const ref = await addDoc(collection(db, 'tests'), {
             title: `${w.title} ${r.label}`.slice(0, 60), description: w.description || '', category: cat, published: !!w.published,
+            classIds: legacyClassIds, visibleTo: visibleFor(!!w.published, legacyClassIds),
             questions: (r.items || []).map((it) => ({ id: it.id, label: it.label || '', fieldId: fmap[it.fieldId] || null, max: it.max })),
             createdAt: Date.now(), updatedAt: Date.now(),
           });
           roundToTest[r.id] = { testId: ref.id, itemIds: (r.items || []).map((it) => it.id) };
           ids.push(ref.id); allIds.push(ref.id);
         }
-        await addDoc(collection(db, 'sets'), { title: `${w.title} ${s.label}`.slice(0, 60), description: '', category: cat, published: !!w.published, testIds: ids, createdAt: Date.now(), updatedAt: Date.now() });
+        await addDoc(collection(db, 'sets'), { title: `${w.title} ${s.label}`.slice(0, 60), description: '', category: cat, published: !!w.published, classIds: legacyClassIds, visibleTo: visibleFor(!!w.published, legacyClassIds), testIds: ids, createdAt: Date.now(), updatedAt: Date.now() });
       }
-      if ((w.sets || []).length > 1) await addDoc(collection(db, 'sets'), { title: `${w.title} 全体`.slice(0, 60), description: '', category: cat, published: !!w.published, testIds: allIds, createdAt: Date.now(), updatedAt: Date.now() });
+      if ((w.sets || []).length > 1) await addDoc(collection(db, 'sets'), { title: `${w.title} 全体`.slice(0, 60), description: '', category: cat, published: !!w.published, classIds: legacyClassIds, visibleTo: visibleFor(!!w.published, legacyClassIds), testIds: allIds, createdAt: Date.now(), updatedAt: Date.now() });
       // 点数
       const old = await getDocs(query(collection(db, 'scores'), where('wbId', '==', w.id)));
       let batch = writeBatch(db), n = 0;
@@ -1622,13 +1720,165 @@ async function migrateLegacy(wbs) {
   } catch (e) { console.error(e); toast('変換できませんでした: ' + errMsg(e)); }
 }
 
+// ---------------------------------------------------------------- teacher: クラス
+async function viewClasses() {
+  const [classes, users] = await Promise.all([loadClasses(), getDocs(collection(db, 'users')).then(docsOf)]);
+  const byId = Object.fromEntries(users.map((u) => [u.id, u]));
+  const inp = h('input', { type: 'text', id: 'new-class', maxlength: 40, placeholder: '例: 3年1組、数学選択A', style: 'flex:1;min-width:12em' });
+  const msg = h('span', { class: 'err small' });
+  const btn = h('button', { class: 'btn primary', type: 'button' }, 'クラスを作る');
+  btn.onclick = async () => {
+    const name = inp.value.trim();
+    if (!name) { msg.textContent = 'クラスの名前を入力してください。'; return; }
+    btn.disabled = true;
+    try {
+      const ref = await addDoc(collection(db, 'classes'), { name, teacherIds: [S.user.uid], studentIds: [], createdAt: Date.now(), updatedAt: Date.now() });
+      location.hash = `#/t/class/${ref.id}`;
+    } catch (e) { msg.textContent = errMsg(e); btn.disabled = false; }
+  };
+  const mine = myTeachingIds(classes);
+  mount(
+    pageHead('先生用', 'クラス'),
+    h('p', { class: 'notice small' }, 'クラスごとに担当の先生と生徒を登録します。テストやセットは「配信するクラス」を選ぶと、そのクラスの生徒にだけ表示されます。生徒の画面の平均・順位・分布は、同じクラスの人どうしで計算します。1人の生徒が複数のクラスに入ることもできます。'),
+    h('div', { class: 'card' }, h('h2', null, '新しいクラスを作る'), h('div', { class: 'row' }, inp, btn), msg),
+    classes.length ? h('div', { class: 'tscroll' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', null, 'クラス'), h('th', null, '担当の先生'), h('th', { class: 'r' }, '生徒'), h('th', null, ''))),
+      h('tbody', null, classes.map((c) => h('tr', null,
+        h('td', null, h('b', null, c.name), mine.includes(c.id) ? h('span', { class: 'pill accent', style: 'margin-left:8px' }, '担当') : null),
+        h('td', { class: 'small wrap' }, (c.teacherIds || []).map((t) => byId[t]?.displayName).filter(Boolean).join('、') || h('span', { class: 'muted' }, 'なし')),
+        h('td', { class: 'r num' }, `${(c.studentIds || []).filter((u) => byId[u]).length}人`),
+        h('td', null, h('a', { class: 'btn small', href: `#/t/class/${c.id}` }, '編集'))))))) : h('p', { class: 'muted' }, 'まだクラスがありません。'));
+}
+
+async function viewClassEditor(classId) {
+  const [snap, users] = await Promise.all([getDoc(doc(db, 'classes', classId)), getDocs(collection(db, 'users')).then(docsOf)]);
+  if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
+  const orig = snap.data();
+  const c = { name: orig.name || '', teacherIds: [...(orig.teacherIds || [])], studentIds: [...(orig.studentIds || [])] };
+  const teachers = users.filter((u) => u.role === 'teacher').sort(byNumber);
+  const students = users.filter((u) => u.role === 'student').sort(byNumber);
+  const byId = Object.fromEntries(users.map((u) => [u.id, u]));
+  const byNo = Object.fromEntries(students.map((u) => [u.studentNo, u]));
+  let dirty = false;
+  const statusEl = h('span', { class: 'small muted' });
+  const markDirty = () => { dirty = true; statusEl.className = 'small err'; statusEl.textContent = '未保存の変更があります'; };
+  const onBeforeUnload = (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
+  window.addEventListener('beforeunload', onBeforeUnload);
+  S.cleanups.push(() => window.removeEventListener('beforeunload', onBeforeUnload));
+  const box = h('div', { class: 'stack' });
+
+  // 「3101 3102」「3101-3140」「3101,3105」のように書かれた出席番号を読む
+  function parseNumbers(text) {
+    const out = [];
+    for (const part of text.normalize('NFKC').split(/[\s,、，]+/).filter(Boolean)) {
+      const m = part.match(/^(\d{4})[-〜~](\d{4})$/);
+      if (m) { for (let n = Number(m[1]); n <= Number(m[2]) && out.length < 2000; n++) out.push(String(n).padStart(4, '0')); }
+      else out.push(part);
+    }
+    return out;
+  }
+
+  function render() {
+    const nameIn = h('input', { type: 'text', id: 'class-name', value: c.name, maxlength: 40 });
+    nameIn.addEventListener('input', () => { c.name = nameIn.value; markDirty(); });
+    const members = c.studentIds.map((id) => byId[id]).filter(Boolean).sort(byNumber);
+    const addIn = h('textarea', { rows: 2, id: 'class-add', placeholder: '出席番号を入力（例: 3101-3140、または 3101 3102 3105）' });
+    const addMsg = h('span', { class: 'small' });
+    const addBtn = h('button', {
+      class: 'btn small primary', type: 'button', onclick: () => {
+        const text = addIn.value.normalize('NFKC');
+        // 範囲指定（3101-3140）のときは、登録されていない番号があっても知らせない
+        const rangeUsed = /\d{4}\s*[-〜~]\s*\d{4}/.test(text);
+        const nums = parseNumbers(text);
+        const found = nums.map((n) => byNo[n]).filter((u) => u && !c.studentIds.includes(u.id)).map((u) => u.id);
+        const missing = rangeUsed ? [] : nums.filter((n) => !byNo[n]);
+        c.studentIds.push(...new Set(found));
+        if (found.length) markDirty();
+        render();
+        const m = box.querySelector('#class-add-msg');
+        m.className = 'small ' + (found.length ? 'ok' : 'err');
+        m.textContent = `${new Set(found).size}人を追加しました。「保存する」で確定します。`
+          + (missing.length ? `（登録されていない番号: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ' …' : ''}）` : '');
+      },
+    }, '追加');
+    addMsg.id = 'class-add-msg';
+    const prefixes = prefixesOf(students);
+    fill(box,
+      h('div', { class: 'card' },
+        h('div', { class: 'field' }, h('label', { class: 'label', for: 'class-name' }, 'クラスの名前'), nameIn)),
+      h('div', { class: 'card' },
+        h('h2', null, '担当の先生'),
+        h('div', { class: 'row' }, teachers.map((t) => {
+          const cb = h('input', { type: 'checkbox', checked: c.teacherIds.includes(t.id) });
+          cb.addEventListener('change', () => { c.teacherIds = cb.checked ? [...new Set([...c.teacherIds, t.id])] : c.teacherIds.filter((x) => x !== t.id); markDirty(); });
+          return h('label', { class: 'row chk' }, cb, t.displayName, h('span', { class: 'small muted' }, t.email || ''));
+        }))),
+      h('div', { class: 'card' },
+        h('h2', null, `生徒（${members.length}人）`),
+        h('div', { class: 'stack', style: 'gap:8px' },
+          h('div', { class: 'row' }, addIn),
+          h('div', { class: 'row' }, addBtn,
+            prefixes.length ? [h('span', { class: 'small muted' }, 'まとめて追加:'), prefixes.map((p) => h('button', {
+              class: 'btn small', type: 'button', onclick: () => {
+                const add = students.filter((u) => u.studentNo.startsWith(p) && !c.studentIds.includes(u.id)).map((u) => u.id);
+                c.studentIds.push(...add); if (add.length) markDirty(); render();
+              },
+            }, `${p}xx`))] : null),
+          addMsg),
+        members.length ? h('div', { class: 'tscroll' }, h('table', null,
+          h('thead', null, h('tr', null, h('th', { class: 'r' }, '出席番号'), h('th', null, '名前'), h('th', null, ''))),
+          h('tbody', null, members.map((u) => h('tr', null,
+            h('td', { class: 'r num' }, u.studentNo), h('td', null, u.displayName),
+            h('td', null, h('button', { class: 'btn small danger', type: 'button', onclick: () => { c.studentIds = c.studentIds.filter((x) => x !== u.id); markDirty(); render(); } }, 'クラスから外す'))))))) : h('p', { class: 'muted small' }, 'まだ生徒がいません。上の欄に出席番号を入れて追加してください。')));
+  }
+
+  async function save() {
+    if (!c.name.trim()) { statusEl.className = 'small err'; statusEl.textContent = 'クラスの名前を入力してください。'; return; }
+    const before = new Set(orig.studentIds || []);
+    const after = new Set(c.studentIds);
+    const added = [...after].filter((x) => !before.has(x) && byId[x]);
+    const removed = [...before].filter((x) => !after.has(x) && byId[x]);
+    try {
+      // クラスと生徒の「所属クラス」を一緒に更新する（どちらからも同じ内容が見えるように）
+      const ops = [
+        [doc(db, 'classes', classId), { name: c.name.trim(), teacherIds: c.teacherIds, studentIds: [...after], updatedAt: Date.now() }],
+        ...added.map((u) => [doc(db, 'users', u), { classIds: arrayUnion(classId) }]),
+        ...removed.map((u) => [doc(db, 'users', u), { classIds: arrayRemove(classId) }]),
+      ];
+      for (let i = 0; i < ops.length; i += 400) { const b = writeBatch(db); ops.slice(i, i + 400).forEach(([r, d]) => b.update(r, d)); await b.commit(); }
+      orig.studentIds = [...after];
+      dirty = false; statusEl.className = 'small ok'; statusEl.textContent = '保存しました'; toast('保存しました');
+    } catch (e) { statusEl.className = 'small err'; statusEl.textContent = errMsg(e); }
+  }
+  const delBtn = confirmButton('このクラスを削除', 'もう一度押すと削除（生徒・テスト・点数は消えません）', async () => {
+    try {
+      const ops = [];
+      for (const u of orig.studentIds || []) if (byId[u]) ops.push([doc(db, 'users', u), { classIds: arrayRemove(classId) }]);
+      for (const col of ['tests', 'sets']) {
+        const s = await getDocs(query(collection(db, col), where('classIds', 'array-contains', classId)));
+        for (const d of s.docs) ops.push([d.ref, { classIds: arrayRemove(classId), visibleTo: arrayRemove(classId) }]);
+      }
+      for (let i = 0; i < ops.length; i += 400) { const b = writeBatch(db); ops.slice(i, i + 400).forEach(([r, d]) => b.update(r, d)); await b.commit(); }
+      await deleteDoc(doc(db, 'classes', classId));
+      dirty = false; toast('クラスを削除しました'); location.hash = '#/t/classes';
+    } catch (e) { toast(errMsg(e)); }
+  });
+  render();
+  mount(
+    pageHead(h('a', { href: '#/t/classes' }, '← クラス'), 'クラスの編集'),
+    box,
+    h('div', { class: 'sticky-save' }, h('button', { class: 'btn primary', type: 'button', onclick: save }, '保存する'), statusEl, h('span', { class: 'spacer' }), delBtn));
+}
+
 // ---------------------------------------------------------------- teacher: users
 async function viewUsers() {
-  const [uSnap, tSnap, setSnap] = await Promise.all([
+  const [uSnap, tSnap, setSnap, classes] = await Promise.all([
     getDocs(collection(db, 'users')),
     getDoc(doc(db, 'config', 'teachers')).catch(() => null),
     getDoc(doc(db, 'config', 'settings')).catch(() => null),
+    loadClasses(),
   ]);
+  const mine = myTeachingIds(classes);
   const sortUsers = (list) => list.sort((a, b) => (a.role === b.role ? 0 : a.role === 'teacher' ? -1 : 1) || byNumber(a, b));
   let users = sortUsers(uSnap.docs.map((d) => ({ uid: d.id, ...d.data() })));
   let teacherEmails = (tSnap && tSnap.exists() && Array.isArray(tSnap.data().emails)) ? [...tSnap.data().emails] : [];
@@ -1639,6 +1889,8 @@ async function viewUsers() {
   const bulkMsg = h('div', { class: 'small' });
   const bulkResult = h('div');
   const bulkBtn = h('button', { class: 'btn primary', type: 'button' }, 'アカウントを作成');
+  const bulkClass = h('select', { id: 'bulk-class', 'aria-label': '入れるクラス' },
+    classes.map((c) => h('option', { value: c.id, selected: c.id === mine[0] }, c.name)), h('option', { value: '' }, 'クラスに入れない'));
   bulkBtn.onclick = async () => {
     const lines = bulk.value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     const rows = [], problems = [], seen = new Set();
@@ -1660,7 +1912,8 @@ async function viewUsers() {
       try {
         const cred = await createUserWithEmailAndPassword(a2, studentEmail(r.studentNo), password);
         try {
-          await setDoc(doc(db, 'users', cred.user.uid), { ...r, role: 'student', mustChangePassword: true, createdAt: Date.now() });
+          await setDoc(doc(db, 'users', cred.user.uid), { ...r, role: 'student', mustChangePassword: true, createdAt: Date.now(), classIds: bulkClass.value ? [bulkClass.value] : [] });
+          if (bulkClass.value) await updateDoc(doc(db, 'classes', bulkClass.value), { studentIds: arrayUnion(cred.user.uid), updatedAt: Date.now() });
         } catch (e) { await cred.user.delete().catch(() => {}); throw e; }
         results.push({ ...r, password, ok: true });
       } catch (e) {
@@ -1685,7 +1938,7 @@ async function viewUsers() {
   const bulkCard = h('div', { class: 'card' },
     h('h2', null, '生徒アカウントをまとめて作成'),
     h('p', { class: 'small muted' }, '1行に1人、「出席番号（4桁）,名前」の順で入力します（表計算ソフトからの貼り付けも可）。初期パスワードは自動で作られます。生徒は「出席番号・名前・パスワード」でログインし、最初に自分のパスワードへ変更します。'),
-    bulk, h('div', { class: 'row' }, bulkBtn), bulkMsg, bulkResult);
+    bulk, h('div', { class: 'row' }, h('label', { class: 'label', for: 'bulk-class' }, '入れるクラス'), bulkClass, bulkBtn), bulkMsg, bulkResult);
 
   // ---- アカウント一覧
   const listBox = h('div', { class: 'tscroll' });
@@ -1701,11 +1954,19 @@ async function viewUsers() {
   function renderList() {
     const cur = filterSel.value;
     fill(filterSel, h('option', { value: '' }, 'すべて'), h('option', { value: 'teacher', selected: cur === 'teacher' }, '先生のみ'),
+      h('option', { value: 'noclass', selected: cur === 'noclass' }, 'クラスに入っていない生徒'),
+      classes.map((c) => h('option', { value: 'c:' + c.id, selected: cur === 'c:' + c.id }, c.name)),
       prefixesOf(users).map((p) => h('option', { value: p, selected: p === cur }, `${p}xx`)));
     const f = filterSel.value;
-    const shown = users.filter((u) => !f || (f === 'teacher' ? u.role === 'teacher' : u.role === 'student' && (u.studentNo || '').startsWith(f)));
+    const shown = users.filter((u) => {
+      if (!f) return true;
+      if (f === 'teacher') return u.role === 'teacher';
+      if (f === 'noclass') return u.role === 'student' && !(u.classIds || []).length;
+      if (f.startsWith('c:')) { const id = f.slice(2); return u.role === 'student' ? (u.classIds || []).includes(id) : (classes.find((x) => x.id === id)?.teacherIds || []).includes(u.uid); }
+      return u.role === 'student' && (u.studentNo || '').startsWith(f);
+    });
     fill(listBox, h('table', null,
-      h('thead', null, h('tr', null, h('th', null, '出席番号 / メール'), h('th', null, '名前'), h('th', null, '役割'), h('th', null, 'パスワード'), h('th', null, '操作'))),
+      h('thead', null, h('tr', null, h('th', null, '出席番号 / メール'), h('th', null, '名前'), h('th', null, '役割'), h('th', null, 'クラス'), h('th', null, 'パスワード'), h('th', null, '操作'))),
       h('tbody', null, shown.map((u) => userRow(u)))));
   }
 
@@ -1731,6 +1992,10 @@ async function viewUsers() {
             const b = writeBatch(db); s.docs.forEach((d) => b.delete(d.ref)); if (s.docs.length) await b.commit();
           }
           if (student) await deleteDoc(doc(db, 'goals', u.uid)).catch(() => {});
+          for (const c of classes) {
+            if ((c.studentIds || []).includes(u.uid)) await updateDoc(doc(db, 'classes', c.id), { studentIds: arrayRemove(u.uid) });
+            if ((c.teacherIds || []).includes(u.uid)) await updateDoc(doc(db, 'classes', c.id), { teacherIds: arrayRemove(u.uid) });
+          }
           await deleteDoc(doc(db, 'users', u.uid));
           users = users.filter((x) => x.uid !== u.uid);
           renderList();
@@ -1739,7 +2004,13 @@ async function viewUsers() {
       }));
     }
     tr.append(h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, u.displayName),
-      h('td', null, student ? '生徒' : h('span', { class: 'pill accent' }, '先生')), pwCell, actions);
+      h('td', null, student ? '生徒' : h('span', { class: 'pill accent' }, '先生')),
+      h('td', { class: 'small wrap' }, (() => {
+        // 生徒は自分の「所属クラス」、先生はクラスの担当者から
+        const names = student ? classNames(u.classIds, classes) : classes.filter((c) => (c.teacherIds || []).includes(u.uid)).map((c) => c.name);
+        return names.length ? names.join('、') : h('span', { class: student ? 'pill warn' : 'muted' }, student ? '未所属' : '—');
+      })()),
+      pwCell, actions);
 
     function editRow() {
       const nm = h('input', { type: 'text', value: u.displayName, maxlength: 40, 'aria-label': '名前' });
@@ -1751,7 +2022,7 @@ async function viewUsers() {
           catch (e) { toast(errMsg(e)); }
         },
       }, '保存');
-      fill(tr, h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, nm), h('td'), h('td'),
+      fill(tr, h('td', { class: 'num' }, student ? u.studentNo : u.email), h('td', null, nm), h('td'), h('td'), h('td'),
         h('td', { class: 'row', style: 'flex-wrap:nowrap' }, save, h('button', { class: 'btn small', type: 'button', onclick: () => renderList() }, 'やめる')));
     }
     return tr;
