@@ -189,6 +189,7 @@ async function renderRoute() {
       const [t0, kind, id, sub, uid, sub2] = parts;
       if (t0 === 't' && kind === 'users') return await viewUsers();
       if (t0 === 't' && kind === 'classes') return await viewClasses();
+      if (t0 === 't' && kind === 'fields') return await viewFields();
       if (t0 === 't' && kind === 'class' && id) return await viewClassEditor(id);
       if (t0 === 't' && (kind === 'test' || kind === 'set') && id) {
         if (sub === 'edit') return kind === 'test' ? await viewTestEditor(id) : await viewSetEditor(id);
@@ -502,10 +503,25 @@ const qItems = (t) => {
 const testMax = (t) => evalGroup(qItems(t), {}).max;
 const blockName = (b) => (/^\d+$/.test(b) ? `第${b}問` : b);
 
-async function loadFields(cat) {
+// 分野リスト（タブごとに1つ）: 科目 subjects と、科目に属する分野 fields（subjectId）
+async function loadFieldList(cat) {
   const s = await getDoc(doc(db, 'fieldLists', cat));
-  return s.exists() && Array.isArray(s.data().fields) ? s.data().fields : [];
+  const d = s.exists() ? s.data() : {};
+  return { fields: Array.isArray(d.fields) ? d.fields : [], subjects: Array.isArray(d.subjects) ? d.subjects : [] };
 }
+async function loadFields(cat) { return (await loadFieldList(cat)).fields; }
+const subjectName = (id, subjects) => (subjects.find((x) => x.id === id) || {}).name || '';
+// 科目で絞り込むセレクト（そのタブにある科目だけ）。value: '' = すべて / '__none' = 科目未設定 / 科目ID
+function subjectSelect(subjects, tests, current, onChange, id) {
+  const used = new Set(tests.map((t) => t.subjectId || '__none'));
+  const sel = h('select', { id, 'aria-label': '科目' },
+    h('option', { value: '' }, 'すべての科目'),
+    subjects.filter((x) => used.has(x.id)).map((x) => h('option', { value: x.id, selected: current === x.id }, x.name)),
+    used.has('__none') ? h('option', { value: '__none', selected: current === '__none' }, '科目未設定') : null);
+  sel.onchange = () => onChange(sel.value);
+  return sel;
+}
+const matchSubject = (t, f) => !f || (f === '__none' ? !t.subjectId : t.subjectId === f);
 // 先生はすべて、生徒は自分のクラスに公開中のもの（visibleTo）だけ読める（ルールに合わせたクエリにする）
 async function loadAll(col) {
   if (isTeacher()) return docsOf(await getDocs(collection(db, col))).sort(byTitle);
@@ -682,11 +698,14 @@ async function viewStudentHome() {
   // 先生がクラスを変えたときに備えて、プロフィール（所属クラス）を読み直す
   const prof = await getDoc(doc(db, 'users', uid));
   if (prof.exists()) S.profile = prof.data();
-  const [tests, sets, mySnap, goalSnap] = await Promise.all([
+  const [tests, sets, mySnap, goalSnap, kyotsuList, otherList] = await Promise.all([
     loadAll('tests'), loadAll('sets'),
     getDocs(query(collection(db, 'scores'), where('uid', '==', uid))),
     getDoc(doc(db, 'goals', uid)),
+    loadFieldList('kyotsu'), loadFieldList('other'),
   ]);
+  const lists = { kyotsu: kyotsuList, other: otherList };
+  let subjFilter = (() => { try { return localStorage.getItem('subj') || ''; } catch (e) { return ''; } })();
   const mine = Object.fromEntries(mySnap.docs.map((d) => [d.data().testId, d.data()]));
   const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
   let goal = goalSnap.exists() && isNum(goalSnap.data().kyotsu) ? goalSnap.data().kyotsu : null;
@@ -696,8 +715,16 @@ async function viewStudentHome() {
   const body = h('div', { class: 'stack' });
 
   function render() {
-    const ts = tests.filter((t) => catOf(t) === cat);
-    const ss = sets.filter((s) => catOf(s) === cat);
+    const inTab = tests.filter((t) => catOf(t) === cat);
+    const subjects = lists[cat].subjects;
+    if (subjFilter && !inTab.some((t) => matchSubject(t, subjFilter))) subjFilter = '';
+    const ts = inTab.filter((t) => matchSubject(t, subjFilter));
+    const ss = sets.filter((s) => catOf(s) === cat && (!subjFilter || (s.testIds || []).some((id) => testsById[id] && matchSubject(testsById[id], subjFilter))));
+    // 科目のボタン（このタブにある科目だけ）
+    const usedSubj = [...new Set(inTab.map((t) => t.subjectId || '__none'))];
+    const chips = usedSubj.length > 1 ? h('div', { class: 'subj-chips' },
+      [['', 'すべて'], ...subjects.filter((x) => usedSubj.includes(x.id)).map((x) => [x.id, x.name]), ...(usedSubj.includes('__none') ? [['__none', 'その他']] : [])].map(([v, label]) =>
+        h('button', { class: 'chip-btn', type: 'button', 'aria-pressed': String(subjFilter === v), onclick: () => { subjFilter = v; try { localStorage.setItem('subj', v); } catch (e) { /* noop */ } render(); } }, label))) : null;
     const goalCard = cat === 'kyotsu' ? h('div', { class: 'card goal-card' },
       h('div', { class: 'row' }, h('h2', null, '共通テストの目標点'), goalInput(uid, goal, (v) => { goal = v; renderTests(); })),
       h('p', { class: 'small muted' }, '100点満点あたりの目標点を1つ決めます。すべての共通テストの結果がこの目標と比べられます（200点満点のテストなら2倍で判定）。')) : null;
@@ -718,13 +745,14 @@ async function viewStudentHome() {
     const testTable = h('div', { class: 'tscroll' });
     function renderTests() {
       fill(testTable, ts.length ? h('table', null,
-        h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', { class: 'r' }, '得点'), h('th', { class: 'r' }, '得点率'), h('th', null, cat === 'kyotsu' ? '目標' : ''), h('th', null, '記入日'))),
+        h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', null, '科目'), h('th', { class: 'r' }, '得点'), h('th', { class: 'r' }, '得点率'), h('th', null, cat === 'kyotsu' ? '目標' : ''), h('th', null, '記入日'))),
         h('tbody', null, ts.map((t) => {
           const rec = mine[t.id] || {};
           const g = evalGroup(qItems(t), rec.scores);
           const target = cat === 'kyotsu' ? kyotsuTarget(goal, g.max) : null;
           return h('tr', null,
             h('td', null, h('a', { href: `#/test/${t.id}` }, t.title)),
+            h('td', { class: 'small muted' }, subjectName(t.subjectId, subjects)),
             h('td', { class: 'r num' }, g.count ? `${fmt(g.sum)} / ${fmt(g.complete ? g.max : g.enteredMax)}` : '—', g.count && !g.complete ? h('span', { class: 'muted small' }, ' 途中') : ''),
             h('td', { class: `r num ${heat(g.rate)}` }, pct(g.rate)),
             h('td', null, cat === 'kyotsu' && g.complete && target !== null ? (g.sum >= target ? h('span', { class: 'pill good' }, '達成') : h('span', { class: 'pill warn' }, `あと${fmt(Math.round((target - g.sum) * 10) / 10)}`)) : ''),
@@ -734,6 +762,7 @@ async function viewStudentHome() {
     renderTests();
     fill(body,
       goalCard,
+      chips,
       ss.length ? h('section', { class: 'stack' }, h('h2', null, 'セット'), h('div', { class: 'wb-list' }, setCards)) : null,
       h('section', { class: 'stack' }, h('h2', null, 'テスト'), testTable));
   }
@@ -762,8 +791,8 @@ async function viewTest(testId, uid, mode) {
   const max = testMax(test);
   const scoreRef = doc(db, 'scores', `${testId}_${uid}`);
   const noteRef = doc(db, 'notes', `${testId}_${uid}`);
-  const [fields, sets, classes, sSnap, nSnap, gSnap, pSnap] = await Promise.all([
-    loadFields(catOf(test)),
+  const [{ fields, subjects }, sets, classes, sSnap, nSnap, gSnap, pSnap] = await Promise.all([
+    loadFieldList(catOf(test)),
     loadAll('sets'),
     loadClasses(),
     isPreview ? null : getDoc(scoreRef),
@@ -983,7 +1012,7 @@ async function viewTest(testId, uid, mode) {
   const sw = mode === 'teacher-view' ? h('a', { class: 'btn small', href: `#/t/test/${testId}/u/${uid}/edit` }, 'この生徒の点数を修正する')
     : mode === 'teacher-edit' ? h('a', { class: 'btn small', href: `#/t/test/${testId}/u/${uid}` }, '修正を終える') : null;
   mount(
-    pageHead(h('span', null, back, '　', catPill(test)), test.title, teacherMode || isPreview ? `${studentLine(who)} さんの記録` : studentLine(who), h('div', { class: 'row' }, sw, saveEl)),
+    pageHead(h('span', null, back, '　', catPill(test), subjectName(test.subjectId, subjects) ? [' ', h('span', { class: 'pill' }, subjectName(test.subjectId, subjects))] : null), test.title, teacherMode || isPreview ? `${studentLine(who)} さんの記録` : studentLine(who), h('div', { class: 'row' }, sw, saveEl)),
     isPreview ? h('p', { class: 'notice warn small' }, '生徒の画面のプレビューです。点数を入れて動きを確かめられますが、保存されず、集計にも入りません。') : null,
     test.description ? h('p', { class: 'notice' }, test.description) : null,
     inSets.length ? h('p', { class: 'small' }, 'このテストを含むセット: ', inSets.map((s, i) => [i ? '、' : '', h('a', { href: teacherMode ? `#/t/set/${s.id}/u/${uid}` : isPreview ? `#/t/set/${s.id}/results` : `#/set/${s.id}` }, s.title)])) : null,
@@ -1082,12 +1111,15 @@ async function viewSet(setId, uid, mode) {
 
 // ---------------------------------------------------------------- teacher: home
 async function viewTeacherHome() {
-  const [tests, sets, classes, oldWbs] = await Promise.all([
+  const [tests, sets, classes, oldWbs, kyotsuList, otherList] = await Promise.all([
     loadAll('tests'), loadAll('sets'), loadClasses(),
     getDocs(collection(db, 'workbooks')).then(docsOf).catch(() => []),
+    loadFieldList('kyotsu'), loadFieldList('other'),
   ]);
   const legacy = oldWbs.filter((w) => !w.migratedAt);
   let cat = loadCat();
+  const lists = { kyotsu: kyotsuList, other: otherList };
+  let subjFilter = '';
   const mine = myTeachingIds(classes);
   // 表示するクラス: 担当クラス（mine）／すべて（all）／クラスID／配信先なし（none）
   let clsFilter = (() => { try { return localStorage.getItem('clsFilter') || ''; } catch (e) { return ''; } })();
@@ -1104,7 +1136,8 @@ async function viewTeacherHome() {
   const tabsBox = h('div');
 
   async function createTest(title) {
-    const ref = await addDoc(collection(db, 'tests'), { title, description: '', category: cat, published: false, classIds: newClassIds(), visibleTo: [], questions: [], createdAt: Date.now(), updatedAt: Date.now() });
+    const subjectId = subjFilter && subjFilter !== '__none' ? subjFilter : null;
+    const ref = await addDoc(collection(db, 'tests'), { title, description: '', category: cat, subjectId, published: false, classIds: newClassIds(), visibleTo: [], questions: [], createdAt: Date.now(), updatedAt: Date.now() });
     location.hash = `#/t/test/${ref.id}/edit`;
   }
   async function createSet(title) {
@@ -1140,9 +1173,14 @@ async function viewTeacherHome() {
     return h('td', { class: 'small wrap' }, names.length ? names.join('、') : h('span', { class: 'pill warn' }, 'クラス未選択'));
   };
   function render() {
-    const ts = tests.filter((t) => catOf(t) === cat && matches(t));
-    const ss = sets.filter((s) => catOf(s) === cat && matches(s));
+    const inTab = tests.filter((t) => catOf(t) === cat && matches(t));
+    const subjects = lists[cat].subjects;
+    if (subjFilter && subjFilter !== '__none' && !inTab.some((t) => t.subjectId === subjFilter)) subjFilter = '';
+    const ts = inTab.filter((t) => matchSubject(t, subjFilter));
     const testsById = Object.fromEntries(tests.map((t) => [t.id, t]));
+    // セットは、中のテストが選んだ科目を含むものを表示
+    const ss = sets.filter((s) => catOf(s) === cat && matches(s) && (!subjFilter || (s.testIds || []).some((id) => testsById[id] && matchSubject(testsById[id], subjFilter))));
+    const nFields = lists[cat].fields.length, nUnassigned = lists[cat].fields.filter((f) => !subjects.some((x) => x.id === f.subjectId)).length;
     const counts = { kyotsu: tests.filter((t) => isKyotsu(t) && matches(t)).length, other: tests.filter((t) => !isKyotsu(t) && matches(t)).length };
     fill(tabsBox, catTabs(cat, counts, (k) => { cat = k; render(); }));
     fill(body,
@@ -1152,7 +1190,15 @@ async function viewTeacherHome() {
         h('h2', null, '以前の形式の得点表があります'),
         h('p', { class: 'small' }, `${legacy.map((w) => w.title).join('、')} を新しい形式（テスト＋セット）に変換できます。回は1つずつのテストに、得点表の中のセットは「セット」に変換され、記入済みの点数も引き継がれます（目標・メモは引き継がれません）。`),
         h('div', null, confirmButton('新しい形式に変換する', 'もう一度押すと変換を始めます', () => migrateLegacy(legacy), 'btn primary'))) : null,
-      fieldListEditor(cat),
+      h('div', { class: 'card compact' },
+        h('div', { class: 'row' },
+          h('h2', null, '分野と科目'),
+          h('span', { class: 'small muted' }, `科目 ${subjects.length} ・ 分野 ${nFields}`),
+          nUnassigned ? h('span', { class: 'pill warn' }, `科目未設定の分野 ${nUnassigned}`) : null,
+          h('span', { class: 'spacer' }),
+          h('a', { class: 'btn small', href: '#/t/fields' }, '分野と科目を管理')),
+        h('div', { class: 'row' }, h('label', { class: 'label', for: 'subj-filter' }, '科目で絞り込み'),
+          subjectSelect(subjects, inTab, subjFilter, (v) => { subjFilter = v; render(); }, 'subj-filter'))),
       h('section', { class: 'card' },
         h('h2', null, 'セット'),
         h('p', { class: 'small muted' }, 'テストをまとめたものです（例: 「セット1」＝第1回＋第2回、「数学ⅠA 全体」＝第1回〜第14回）。セットごとに分野別の統計と得点率の分布が出ます。'),
@@ -1177,9 +1223,10 @@ async function viewTeacherHome() {
         h('p', { class: 'small muted' }, '1回分のテスト（問題番号・分野・配点）です。「複製」で同じ構成のテストを作れます（名前の数字は自動で次の番号になります）。公開すると生徒が記入できます。'),
         createRow(cat === 'kyotsu' ? '例: 第1回 数学Ⅰ・A' : '例: 二次対策 数学 演習1', 'テストを作る', createTest),
         ts.length ? h('div', { class: 'tscroll' }, h('table', null,
-          h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', { class: 'r' }, '問題数'), h('th', { class: 'r' }, '満点'), h('th', null, '配信先'), h('th', null, '状態'), h('th', null, '操作'))),
+          h('thead', null, h('tr', null, h('th', null, 'テスト'), h('th', null, '科目'), h('th', { class: 'r' }, '問題数'), h('th', { class: 'r' }, '満点'), h('th', null, '配信先'), h('th', null, '状態'), h('th', null, '操作'))),
           h('tbody', null, ts.map((t) => h('tr', null,
             h('td', null, h('b', null, t.title)),
+            h('td', { class: 'small' }, subjectName(t.subjectId, subjects) || h('span', { class: 'pill warn' }, '未設定')),
             h('td', { class: 'r num' }, (t.questions || []).length),
             h('td', { class: 'r num' }, fmt(testMax(t))),
             classCell(t),
@@ -1199,7 +1246,7 @@ async function viewTeacherHome() {
     h('option', { value: 'none', selected: clsFilter === 'none' }, 'クラス未選択のもの'));
   clsSel.onchange = () => { clsFilter = clsSel.value; try { localStorage.setItem('clsFilter', clsFilter); } catch (e) { /* noop */ } render(); };
   mount(
-    pageHead('先生用', '得点表の管理', null, h('div', { class: 'row' }, h('label', { class: 'label', for: 'cls-filter' }, '表示するクラス'), clsSel, h('a', { class: 'btn small', href: '#/t/classes' }, 'クラスの管理'))),
+    pageHead('先生用', '得点表の管理', null, h('div', { class: 'row' }, h('label', { class: 'label', for: 'cls-filter' }, '表示するクラス'), clsSel, h('a', { class: 'btn small', href: '#/t/classes' }, 'クラスの管理'), h('a', { class: 'btn small', href: '#/t/fields' }, '分野と科目'))),
     tabsBox,
     body);
   render();
@@ -1217,7 +1264,7 @@ async function duplicateTest(t, all) {
   try {
     const ref = await addDoc(collection(db, 'tests'), {
       title: nextTitle(t.title, all.map((x) => x.title)).slice(0, 60), description: t.description || '', category: catOf(t), published: false,
-      classIds: [...(t.classIds || [])], visibleTo: [],
+      classIds: [...(t.classIds || [])], visibleTo: [], subjectId: t.subjectId || null,
       questions: (t.questions || []).map((q) => ({ ...q })), choiceGroups: (t.choiceGroups || []).map((g) => ({ ...g })), createdAt: Date.now(), updatedAt: Date.now(),
     });
     toast('複製しました（非公開で作成しています）');
@@ -1225,42 +1272,155 @@ async function duplicateTest(t, all) {
   } catch (e) { toast(errMsg(e)); }
 }
 
-// ---------------------------------------------------------------- teacher: 分野リスト（タブ全体で共通）
-function fieldListEditor(cat) {
-  const box = h('div', { class: 'ed-fields' });
-  const msg = h('span', { class: 'small' });
-  let fields = [];
+// ---------------------------------------------------------------- teacher: 分野と科目（タブごと）
+async function viewFields() {
+  let cat = loadCat();
+  let data = { fields: [], subjects: [] };
+  let usage = {};
   let dirty = false;
-  const card = h('section', { class: 'card' },
-    h('div', { class: 'row' }, h('h2', null, `分野（${CAT_SHORT[cat]}で共通）`)),
-    h('p', { class: 'small muted' }, `ここで決めた分野を、${CAT_SHORT[cat]}のすべてのテストで使います。分野名を変えると、すべてのテストと集計に反映されます。`),
-    box,
-    h('div', { class: 'row' },
-      h('button', { class: 'btn small', type: 'button', onclick: () => { fields.push({ id: rid('f_'), name: '' }); dirty = true; render(); box.querySelector('.ed-field:last-child input')?.focus(); } }, '＋ 分野を追加'),
-      h('button', { class: 'btn small primary', type: 'button', onclick: save }, '分野を保存'), msg));
-  function render() {
-    fill(box, fields.length ? fields.map((f, i) => {
-      const inp = h('input', { type: 'text', value: f.name, maxlength: 30, placeholder: '分野名（例: 2次関数）', 'aria-label': '分野名' });
-      inp.addEventListener('input', () => { f.name = inp.value; dirty = true; msg.className = 'small err'; msg.textContent = '未保存の変更があります'; });
-      const mv = (d) => { const j = i + d; if (j < 0 || j >= fields.length) return; [fields[i], fields[j]] = [fields[j], fields[i]]; dirty = true; render(); };
-      return h('div', { class: 'ed-field' }, inp, h('span'),
-        h('button', { class: 'btn small', type: 'button', onclick: () => mv(-1), 'aria-label': '上へ' }, '↑'),
-        h('button', { class: 'btn small', type: 'button', onclick: () => mv(1), 'aria-label': '下へ' }, '↓'),
-        h('button', { class: 'btn small danger', type: 'button', onclick: () => { fields.splice(i, 1); dirty = true; render(); } }, '削除'));
-    }) : h('p', { class: 'muted small' }, 'まだ分野がありません。'));
-  }
-  async function save() {
-    if (fields.some((f) => !f.name.trim())) { msg.className = 'small err'; msg.textContent = '名前のない分野があります。'; return; }
-    try {
-      await setDoc(doc(db, 'fieldLists', cat), { fields: fields.map((f) => ({ id: f.id, name: f.name.trim() })), updatedAt: Date.now() });
-      dirty = false; msg.className = 'small ok'; msg.textContent = '保存しました';
-    } catch (e) { msg.className = 'small err'; msg.textContent = errMsg(e); }
-  }
-  loadFields(cat).then((f) => { fields = f.map((x) => ({ ...x })); render(); }).catch((e) => { msg.className = 'small err'; msg.textContent = errMsg(e); });
+  const open = new Set();
+  let queryText = '';
+  const statusEl = h('span', { class: 'small muted' });
+  const markDirty = () => { dirty = true; statusEl.className = 'small err'; statusEl.textContent = '未保存の変更があります'; };
   const onBeforeUnload = (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
   window.addEventListener('beforeunload', onBeforeUnload);
   S.cleanups.push(() => window.removeEventListener('beforeunload', onBeforeUnload));
-  return card;
+  const box = h('div', { class: 'stack' });
+  const tabsBox = h('div');
+  const tests = await loadAll('tests');
+
+  async function load() {
+    const l = await loadFieldList(cat);
+    data = { fields: l.fields.map((f) => ({ ...f, subjectId: f.subjectId ?? null })), subjects: l.subjects.map((s) => ({ ...s })) };
+    // 分野ごとに、使っているテストの数
+    usage = {};
+    for (const t of tests) if (catOf(t) === cat) for (const fid of new Set((t.questions || []).map((q) => q.fieldId).filter(Boolean))) usage[fid] = (usage[fid] || 0) + 1;
+    dirty = false; statusEl.textContent = '';
+    render();
+  }
+
+  const subjectKnown = (id) => data.subjects.some((s) => s.id === id);
+  const fieldsOf = (sid) => data.fields.filter((f) => (sid === null ? !subjectKnown(f.subjectId) : f.subjectId === sid));
+  // 同じ科目の中で、分野の並び順を入れ替える
+  function moveField(f, d) {
+    const same = fieldsOf(subjectKnown(f.subjectId) ? f.subjectId : null);
+    const i = same.indexOf(f), j = i + d;
+    if (j < 0 || j >= same.length) return;
+    const a = data.fields.indexOf(same[i]), b = data.fields.indexOf(same[j]);
+    [data.fields[a], data.fields[b]] = [data.fields[b], data.fields[a]];
+    markDirty(); render();
+  }
+
+  function fieldRow(f) {
+    const nameIn = h('input', { type: 'text', value: f.name, maxlength: 30, 'aria-label': '分野名', placeholder: '分野名' });
+    nameIn.addEventListener('input', () => { f.name = nameIn.value; markDirty(); });
+    const subSel = h('select', { 'aria-label': '科目' },
+      data.subjects.map((s) => h('option', { value: s.id, selected: f.subjectId === s.id }, s.name)),
+      h('option', { value: '', selected: !subjectKnown(f.subjectId) }, '科目未設定'));
+    subSel.addEventListener('change', () => { f.subjectId = subSel.value || null; if (f.subjectId) open.add(f.subjectId); markDirty(); render(); });
+    const n = usage[f.id] || 0;
+    const del = n
+      ? confirmButton('削除', `${n}テストで使用中。もう一度押すと削除`, async () => { data.fields.splice(data.fields.indexOf(f), 1); markDirty(); render(); })
+      : h('button', { class: 'btn small danger', type: 'button', onclick: () => { data.fields.splice(data.fields.indexOf(f), 1); markDirty(); render(); } }, '削除');
+    return h('div', { class: 'fl-row' },
+      nameIn, subSel,
+      h('span', { class: 'small muted num' }, n ? `${n}テスト` : '未使用'),
+      h('span', { class: 'row', style: 'gap:4px;flex-wrap:nowrap' },
+        h('button', { class: 'btn small', type: 'button', onclick: () => moveField(f, -1), 'aria-label': '上へ' }, '↑'),
+        h('button', { class: 'btn small', type: 'button', onclick: () => moveField(f, 1), 'aria-label': '下へ' }, '↓'),
+        del));
+  }
+
+  function subjectBlock(s) {
+    const isNone = s === null;
+    const list = fieldsOf(isNone ? null : s.id);
+    const q = queryText.trim();
+    // 名前がまだ空の分野（追加したばかり）は、探している間も表示する
+    const hit = q ? list.filter((f) => !f.name || f.name.includes(q)) : list;
+    if (q && !hit.length && !(s && s.name.includes(q))) return null;
+    const det = h('details', { class: 'subj', open: !!q || open.has(isNone ? '__none' : s.id) });
+    det.addEventListener('toggle', () => { const k = isNone ? '__none' : s.id; if (det.open) open.add(k); else open.delete(k); });
+    const head = h('summary', null, h('b', null, isNone ? '科目未設定' : s.name), h('span', { class: 'pill' }, `${list.length}分野`));
+    const body = h('div', { class: 'subj-body' });
+    if (!isNone) {
+      const sn = h('input', { type: 'text', value: s.name, maxlength: 30, 'aria-label': '科目名' });
+      sn.addEventListener('input', () => { s.name = sn.value; markDirty(); head.querySelector('b').textContent = sn.value || '（名前なし）'; });
+      const idx = data.subjects.indexOf(s);
+      const mv = (d) => { const j = idx + d; if (j < 0 || j >= data.subjects.length) return; [data.subjects[idx], data.subjects[j]] = [data.subjects[j], data.subjects[idx]]; markDirty(); render(); };
+      body.append(h('div', { class: 'row' }, h('span', { class: 'label' }, '科目名'), sn,
+        h('button', { class: 'btn small', type: 'button', onclick: () => mv(-1) }, '↑'),
+        h('button', { class: 'btn small', type: 'button', onclick: () => mv(1) }, '↓'),
+        confirmButton('科目を削除', 'もう一度押すと削除（分野は「科目未設定」へ）', async () => {
+          for (const f of data.fields) if (f.subjectId === s.id) f.subjectId = null;
+          data.subjects.splice(data.subjects.indexOf(s), 1); markDirty(); render();
+        })));
+    }
+    body.append(
+      hit.length ? h('div', { class: 'stack', style: 'gap:6px' }, hit.map(fieldRow)) : h('p', { class: 'muted small' }, isNone ? '科目が決まっていない分野はありません。' : 'まだ分野がありません。'),
+      h('div', null, h('button', {
+        class: 'btn small', type: 'button', onclick: () => {
+          data.fields.push({ id: rid('f_'), name: '', subjectId: isNone ? null : s.id });
+          open.add(isNone ? '__none' : s.id); markDirty(); render();
+          const ins = box.querySelectorAll('details[open] .fl-row input[aria-label="分野名"]');
+          [...ins].find((x) => !x.value)?.focus();
+        },
+      }, '＋ 分野を追加')));
+    det.append(head, body);
+    return det;
+  }
+
+  function render() {
+    fill(tabsBox, catTabs(cat, null, async (k) => {
+      // 未保存の変更があるときは切り替えない（タブの表示を元に戻す）
+      if (dirty) { saveCat(cat); toast('保存してから切り替えてください'); render(); return; }
+      cat = k; await load();
+    }));
+    const search = h('input', { type: 'search', id: 'field-search', value: queryText, placeholder: '分野・科目を探す', style: 'flex:1;min-width:12em' });
+    search.addEventListener('input', () => { queryText = search.value; const pos = search.selectionStart; render(); const el = document.getElementById('field-search'); el.focus(); el.setSelectionRange(pos, pos); });
+    const newSub = h('input', { type: 'text', id: 'new-subject', maxlength: 30, placeholder: '例: 数学Ⅲ', style: 'flex:1;min-width:10em' });
+    const unassigned = fieldsOf(null).length;
+    fill(box,
+      h('div', { class: 'row' }, search,
+        h('button', { class: 'btn small', type: 'button', onclick: () => { data.subjects.forEach((s) => open.add(s.id)); open.add('__none'); render(); } }, 'すべて開く'),
+        h('button', { class: 'btn small', type: 'button', onclick: () => { open.clear(); render(); } }, 'すべて閉じる')),
+      unassigned ? h('p', { class: 'notice warn small' }, `科目が決まっていない分野が${unassigned}個あります。下の「科目未設定」を開き、それぞれの「科目」を選んでください。`) : null,
+      subjectBlock(null),
+      // 分野がある科目（または開いた科目）は一覧で、分野がまだない科目はボタンにまとめる
+      data.subjects.filter((x) => queryText.trim() || fieldsOf(x.id).length || open.has(x.id)).map(subjectBlock),
+      (() => {
+        const empty = data.subjects.filter((x) => !queryText.trim() && !fieldsOf(x.id).length && !open.has(x.id));
+        return empty.length ? h('div', { class: 'card compact' },
+          h('div', { class: 'row' }, h('h2', null, '分野がまだない科目'), h('span', { class: 'small muted' }, '押すと開いて、分野を追加できます')),
+          h('div', { class: 'subj-chips' }, empty.map((x) => h('button', { class: 'chip-btn', type: 'button', onclick: () => { open.add(x.id); render(); } }, x.name)))) : null;
+      })(),
+      h('div', { class: 'card' }, h('h2', null, '科目を追加'),
+        h('div', { class: 'row' }, newSub, h('button', {
+          class: 'btn primary', type: 'button', onclick: () => {
+            const name = newSub.value.trim(); if (!name) return;
+            const s = { id: rid('sub_'), name }; data.subjects.push(s); open.add(s.id); markDirty(); render();
+          },
+        }, '追加'))));
+  }
+
+  async function save() {
+    if (data.fields.some((f) => !f.name.trim())) { statusEl.className = 'small err'; statusEl.textContent = '名前のない分野があります。'; return; }
+    if (data.subjects.some((s) => !s.name.trim())) { statusEl.className = 'small err'; statusEl.textContent = '名前のない科目があります。'; return; }
+    try {
+      await setDoc(doc(db, 'fieldLists', cat), {
+        fields: data.fields.map((f) => ({ id: f.id, name: f.name.trim(), subjectId: subjectKnown(f.subjectId) ? f.subjectId : null })),
+        subjects: data.subjects.map((s) => ({ id: s.id, name: s.name.trim() })),
+        updatedAt: Date.now(),
+      }, { merge: true });
+      dirty = false; statusEl.className = 'small ok'; statusEl.textContent = '保存しました'; toast('保存しました');
+    } catch (e) { statusEl.className = 'small err'; statusEl.textContent = errMsg(e); }
+  }
+
+  mount(
+    pageHead(h('a', { href: '#/' }, '← 得点表の管理'), '分野と科目', 'タブ（共通テスト／その他の演習）ごとに、科目と、その中の分野を決めます。テストに科目を設定すると、問題の分野はその科目の分野から選べます。'),
+    tabsBox,
+    box,
+    h('div', { class: 'sticky-save' }, h('button', { class: 'btn primary', type: 'button', onclick: save }, '保存する'), statusEl));
+  await load();
 }
 
 // ---------------------------------------------------------------- teacher: テストの編集
@@ -1269,7 +1429,8 @@ async function viewTestEditor(testId) {
   if (!snap.exists()) throw Object.assign(new Error(), { code: 'not-found' });
   const orig = { id: testId, ...snap.data() };
   const t = { title: orig.title, description: orig.description || '', category: catOf(orig), published: !!orig.published, classIds: [...(orig.classIds || [])], questions: (orig.questions || []).map((q) => ({ ...q })), choiceGroups: (orig.choiceGroups || []).map((g) => ({ ...g })) };
-  let fields = await loadFields(t.category);
+  t.subjectId = orig.subjectId || null;
+  let { fields, subjects } = await loadFieldList(t.category);
   const classes = await loadClasses();
   let dirty = false;
   const statusEl = h('span', { class: 'small muted' });
@@ -1317,15 +1478,29 @@ async function viewTestEditor(testId) {
 
   function render() {
     const catSel = h('select', { id: 'ed-cat' }, CATS.map(([k, label]) => h('option', { value: k, selected: t.category === k }, label)));
-    catSel.addEventListener('change', async () => { t.category = catSel.value; fields = await loadFields(t.category); markDirty(); render(); });
+    catSel.addEventListener('change', async () => { t.category = catSel.value; ({ fields, subjects } = await loadFieldList(t.category)); t.subjectId = null; markDirty(); render(); });
+    const subjSel = h('select', { id: 'ed-subject' }, h('option', { value: '' }, '（科目未設定）'),
+      subjects.map((x) => h('option', { value: x.id, selected: t.subjectId === x.id }, x.name)));
+    subjSel.addEventListener('change', () => { t.subjectId = subjSel.value || null; markDirty(); render(); });
     const pub = h('input', { type: 'checkbox', checked: t.published, id: 'ed-pub' });
     pub.addEventListener('change', () => { t.published = pub.checked; markDirty(); render(); });
     const desc = h('textarea', { rows: 2, maxlength: 300, id: 'ed-desc', placeholder: '生徒の画面の上に表示されます（任意）' });
     desc.value = t.description;
     desc.addEventListener('input', () => { t.description = desc.value; markDirty(); });
+    // 分野の選択肢: 科目が決まっていればその科目の分野だけ。決まっていなければ科目ごとにまとめて全部
     const fieldSelect = (q) => {
-      const sel = h('select', { 'aria-label': '分野' }, h('option', { value: '' }, '（分野なし）'),
-        fields.map((f) => h('option', { value: f.id, selected: q.fieldId === f.id }, f.name)));
+      let opts;
+      if (t.subjectId) {
+        opts = fields.filter((f) => f.subjectId === t.subjectId).map((f) => h('option', { value: f.id, selected: q.fieldId === f.id }, f.name));
+        const other = q.fieldId && fields.find((f) => f.id === q.fieldId && f.subjectId !== t.subjectId);
+        if (other) opts.push(h('option', { value: other.id, selected: true }, `${other.name}（${subjectName(other.subjectId, subjects) || '科目未設定'}）`));
+      } else {
+        opts = [...subjects, { id: null, name: '科目未設定' }].map((x) => {
+          const fs = fields.filter((f) => (x.id ? f.subjectId === x.id : !subjects.some((y) => y.id === f.subjectId)));
+          return fs.length ? h('optgroup', { label: x.name }, fs.map((f) => h('option', { value: f.id, selected: q.fieldId === f.id }, f.name))) : null;
+        });
+      }
+      const sel = h('select', { 'aria-label': '分野' }, h('option', { value: '' }, '（分野なし）'), opts);
       sel.addEventListener('change', () => { q.fieldId = sel.value || null; markDirty(); });
       return sel;
     };
@@ -1361,14 +1536,18 @@ async function viewTestEditor(testId) {
       h('div', { class: 'card' },
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-title' }, 'テストの名前'), textIn(t, 'title', { id: 'ed-title', maxlength: 60 })),
         h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-desc' }, '説明'), desc),
-        h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-cat' }, '種類'), catSel),
+        h('div', { class: 'row' },
+          h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-cat' }, '種類'), catSel),
+          h('div', { class: 'field' }, h('label', { class: 'label', for: 'ed-subject' }, '科目'), subjSel)),
         h('div', { class: 'field' }, h('span', { class: 'label' }, '配信するクラス'), classPicker(classes, t.classIds, (ids) => { t.classIds = ids; markDirty(); render(); })),
         h('label', { class: 'row' }, pub, '生徒に公開する（オンにすると、選んだクラスの生徒が記入できます）'),
         t.published && !t.classIds.length ? h('p', { class: 'err' }, 'クラスを選ばないと、公開しても生徒には表示されません。') : null),
       h('div', { class: 'card' },
         h('div', { class: 'row' }, h('h2', null, '問題'), h('span', { class: 'spacer' }), totalEl),
-        h('p', { class: 'small muted' }, `分野は「${CAT_SHORT[t.category]}」タブ共通の分野リストから選びます（得点表の管理画面で追加できます）。`),
-        !fields.length ? h('p', { class: 'notice small' }, '分野がまだありません。得点表の管理画面の「分野」で先に追加すると、ここで選べるようになります。') : null,
+        h('p', { class: 'small muted' }, t.subjectId
+          ? `分野は「${subjectName(t.subjectId, subjects)}」の分野から選びます。`
+          : '科目を選ぶと、分野の選択肢がその科目の分野だけになります。', ' 分野の追加・整理は ', h('a', { href: '#/t/fields' }, '分野と科目'), ' 画面で行います。'),
+        t.subjectId && !fields.some((f) => f.subjectId === t.subjectId) ? h('p', { class: 'notice small' }, 'この科目にはまだ分野がありません。「分野と科目」画面で追加すると、ここで選べるようになります。') : null,
         h('div', { class: 'ed-items' },
           h('div', { class: 'ed-item ed-q label' + (t.choiceGroups.length ? ' with-choice' : '') }, h('span', null, '問題番号'), h('span', null, '分野'), h('span', null, '配点'), t.choiceGroups.length ? h('span', null, '必答/選択') : null, h('span')),
           rows),
@@ -1406,7 +1585,7 @@ async function viewTestEditor(testId) {
     saveBtn.disabled = true;
     try {
       await updateDoc(doc(db, 'tests', testId), {
-        title: t.title.trim(), description: t.description.trim(), category: t.category, published: t.published,
+        title: t.title.trim(), description: t.description.trim(), category: t.category, subjectId: t.subjectId || null, published: t.published,
         classIds: t.classIds, visibleTo: visibleFor(t.published, t.classIds),
         questions: t.questions.map((q) => ({ id: q.id, label: (q.label || '').trim(), fieldId: q.fieldId || null, max: Number(q.max), choiceGroup: t.choiceGroups.some((g) => g.id === q.choiceGroup) ? q.choiceGroup : null })),
         choiceGroups: t.choiceGroups.map((g) => ({ id: g.id, name: (g.name || '').trim(), pick: Number(g.pick) || 1 })),
@@ -1677,10 +1856,10 @@ async function migrateLegacy(wbs) {
       const fmap = {};
       for (const f of w.fields || []) {
         let hit = list.find((x) => x.name === f.name);
-        if (!hit) { hit = { id: rid('f_'), name: f.name }; list.push(hit); }
+        if (!hit) { hit = { id: rid('f_'), name: f.name, subjectId: null }; list.push(hit); }
         fmap[f.id] = hit.id;
       }
-      await setDoc(doc(db, 'fieldLists', cat), { fields: list, updatedAt: Date.now() });
+      await setDoc(doc(db, 'fieldLists', cat), { fields: list, updatedAt: Date.now() }, { merge: true });
       // 回 → テスト、得点表の中のセット → セット、得点表全体 → セット
       const roundToTest = {};
       const allIds = [];
@@ -1688,7 +1867,7 @@ async function migrateLegacy(wbs) {
         const ids = [];
         for (const r of s.rounds || []) {
           const ref = await addDoc(collection(db, 'tests'), {
-            title: `${w.title} ${r.label}`.slice(0, 60), description: w.description || '', category: cat, published: !!w.published,
+            title: `${w.title} ${r.label}`.slice(0, 60), description: w.description || '', category: cat, subjectId: null, published: !!w.published,
             classIds: legacyClassIds, visibleTo: visibleFor(!!w.published, legacyClassIds),
             questions: (r.items || []).map((it) => ({ id: it.id, label: it.label || '', fieldId: fmap[it.fieldId] || null, max: it.max })),
             createdAt: Date.now(), updatedAt: Date.now(),
