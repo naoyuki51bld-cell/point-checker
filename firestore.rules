@@ -8,6 +8,7 @@ rules_version = '2';
 // - classes/{id}       : クラス（先生 teacherIds・生徒 studentIds）。生徒は自分のクラスだけ読める
 // - tests/{id}         : テスト1回分の問題（先生が作成。visibleTo = 公開中の配信先クラス。そのクラスの生徒だけ読める）
 // - sets/{id}          : テストのまとまり（tests と同じ）
+// - resetRequests/{uid}: 生徒のパスワード再発行の受付票（先生だけ。仮パスワードは処理後24時間で消える）
 // - backups/{id}       : デプロイ時の自動バックアップ（アプリからは誰も読み書きできない。ルールを書かないことで拒否）
 // - scores/{test_uid}  : 生徒の点数（平均・順位・分布の計算のため、ログイン済みなら読める。名前は含まない）
 // - notes/{test_uid}   : テストごとの目標点・振り返りメモ（本人と先生だけ）
@@ -143,6 +144,17 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['testId', 'uid', 'target', 'memo', 'updatedAt'])
         && (request.resource.data.memo is string && request.resource.data.memo.size() <= 1000);
       allow delete: if isTeacher();
+    }
+
+    // パスワード再発行の受付票（先生だけ）。処理は GitHub Actions（scripts/reset-passwords.js）が行う
+    match /resetRequests/{uid} {
+      allow read, delete: if isTeacher();
+      allow create, update: if isTeacher()
+        && request.resource.data.keys().hasOnly(['uid', 'requestedBy', 'requestedAt', 'status'])
+        && request.resource.data.uid == uid
+        && request.resource.data.requestedBy == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && get(userPath(uid)).data.role == 'student';
     }
 
     // 共通テストの目標点（生徒ごとに1つ）

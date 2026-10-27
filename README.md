@@ -62,7 +62,8 @@ public/              ← Firebase Hosting で公開するファイル
 firestore.rules      ← セキュリティルール（誰が何を読める・書けるか）
 firebase.json
 .github/workflows/deploy.yml ← main への push で自動デプロイ
-functions/           ← 任意: パスワード再発行用の Cloud Functions（Blaze プランが必要）
+scripts/             ← GitHub Actions から実行する管理用スクリプト（データ変換・パスワード再発行）
+functions/           ← 任意: その場でパスワードを再発行する Cloud Functions（Blaze プランが必要。通常は不要）
 ```
 
 ## セットアップ手順
@@ -161,22 +162,23 @@ firebase deploy --only hosting,firestore:rules
 ※ 平均点・順位・得点分布をブラウザ側で計算するため、点数データは名前を含まない形で他の生徒からも読める設定です。画面には他の人の点数は表示しません。
 これも見せたくない場合は、集計を Cloud Functions で行う構成に変更できます（Blaze プランが必要）。
 
-## 任意: パスワード再発行（Cloud Functions）
-無料の Spark プランのままでは、先生の画面から生徒のパスワードを再発行できません。
+## 生徒のパスワード再発行（無料）
+1. 先生が「生徒・アカウント」画面で、その生徒の「パスワード再発行」を押します（もう一度押して確定）。
+2. GitHub Actions の「生徒のパスワード再発行」（`.github/workflows/password-reset.yml`）が10分ごとに受付を処理し、新しい仮パスワードを設定します。
+3. 先生の画面の「パスワード」欄に仮パスワードが表示されます。生徒に伝えてください。生徒は次のログインで自分のパスワードに変えます。
 
-**再発行できるようにする場合**（Blaze プランが必要。この用途なら通常は無料枠内に収まります）：
-```bash
-cd functions && npm install && cd ..
-firebase deploy --only functions
-```
-デプロイ後、`public/firebase-config.js` の `functionsEnabled` を `true` にして、もう一度 `firebase deploy --only hosting` を実行します。
-「生徒・アカウント」画面に「パスワード再発行」ボタンが出るようになります。アカウントを削除したときに、ログイン情報も一緒に消えるようになります。
+安全のための決まりは次のとおりです。
+- 変えるのはパスワードだけです。アカウント・点数・目標・クラスはそのまま残ります。
+- 仮パスワードは先生だけが見られます。「控えたので消す」を押すか、24時間たつと消えます。ログには件数だけを出します。
+- 急ぐときは、GitHub の Actions タブ →「生徒のパスワード再発行」→ **Run workflow** を押すと、すぐに処理されます。
 
-**Functions を使わない場合**：
-1. Firebase コンソールの Authentication でその生徒を削除します。
-2. アプリで同じ出席番号のアカウントを作り直します。
+注意点が2つあります。
+- GitHub の定期実行は、混んでいると数分〜十数分遅れることがあります。
+- リポジトリに60日間 push がないと、GitHub が定期実行を止めることがあります。止まったときは、Actions タブでワークフローを再び有効にしてください。
 
-この場合、以前の記録は引き継がれません。
+先生自身のパスワードは、ログイン画面の「パスワードを忘れた場合」からメールで再設定できます。
+
+（Blaze プランにして `functions/` をデプロイし、`firebase-config.js` の `functionsEnabled` を `true` にすると、受付を待たずにその場で再発行する方式にもできます。）
 
 ## データの保護（自動バックアップと変換）
 `main` に push すると、GitHub Actions が次の順で実行します（`.github/workflows/deploy.yml`）。

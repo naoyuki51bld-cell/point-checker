@@ -2130,6 +2130,39 @@ async function viewUsers() {
   }
   const call = (name) => httpsCallable(fns, name);
 
+  // パスワード再発行の受付票（GitHub Actions が10分ごとに処理する）。リアルタイムで受け取って表示を更新する
+  let resets = {};
+  if (!fns) {
+    S.cleanups.push(onSnapshot(collection(db, 'resetRequests'), (snap) => {
+      resets = Object.fromEntries(snap.docs.map((d) => [d.id, d.data()]));
+      for (const [uid, el] of Object.entries(pwCells)) renderPwCell(uid, el);
+    }, () => {}));
+  }
+  const pwCells = {};
+  function renderPwCell(uid, cell) {
+    const u = users.find((x) => x.uid === uid);
+    if (!u) return;
+    const r = resets[uid];
+    const base = u.role !== 'student' ? h('span', { class: 'small muted' }, 'メールで再設定')
+      : u.mustChangePassword ? h('span', { class: 'pill warn' }, '初期パスワードのまま') : h('span', { class: 'pill muted' }, '変更済み');
+    if (!r) { fill(cell, base); return; }
+    if (r.status === 'pending') {
+      fill(cell, h('span', { class: 'pill accent' }, '再発行の受付中'), h('div', { class: 'small muted' }, `${new Date(r.requestedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} に受付。10分ほどで表示されます`));
+    } else if (r.status === 'done') {
+      fill(cell, h('div', { class: 'reset-done' },
+        h('span', { class: 'small' }, '新しい仮パスワード'), h('b', { class: 'num' }, r.password),
+        h('button', {
+          class: 'btn small', type: 'button', onclick: async () => {
+            try { await navigator.clipboard.writeText(r.password); toast('コピーしました'); } catch (e) { toast('コピーできませんでした。表示されている文字を書き写してください'); }
+          },
+        }, 'コピー'),
+        h('button', { class: 'btn small link', type: 'button', onclick: async () => { try { await deleteDoc(doc(db, 'resetRequests', uid)); } catch (e) { toast(errMsg(e)); } } }, '控えたので消す')),
+        h('div', { class: 'small muted' }, '生徒に伝えてください。次のログインで自分のパスワードに変えます。24時間たつと表示は消えます。'));
+    } else {
+      fill(cell, base, h('div', { class: 'err' }, r.message || '再発行できませんでした。'));
+    }
+  }
+
   function renderList() {
     const cur = filterSel.value;
     fill(filterSel, h('option', { value: '' }, 'すべて'), h('option', { value: 'teacher', selected: cur === 'teacher' }, '先生のみ'),
@@ -2153,9 +2186,20 @@ async function viewUsers() {
     const tr = h('tr');
     const isMe = u.uid === S.user.uid;
     const student = u.role === 'student';
-    const pwCell = h('td', null, !student ? h('span', { class: 'small muted' }, 'メールで再設定') : u.mustChangePassword ? h('span', { class: 'pill warn' }, '初期パスワードのまま') : h('span', { class: 'pill muted' }, '変更済み'));
-    const actions = h('td', { class: 'row', style: 'flex-wrap:nowrap' });
+    const pwCell = h('td', { class: 'pw-cell' });
+    pwCells[u.uid] = pwCell;
+    renderPwCell(u.uid, pwCell);
+    // 表のセル自体を flex にすると行の高さが崩れるので、中にまとめる
+    const actions = h('div', { class: 'row', style: 'flex-wrap:nowrap' });
     actions.append(h('button', { class: 'btn small', type: 'button', onclick: () => editRow() }, '名前を編集'));
+    if (!fns && student) {
+      actions.append(confirmButton('パスワード再発行', 'もう一度押すと受け付けます', async () => {
+        try {
+          await setDoc(doc(db, 'resetRequests', u.uid), { uid: u.uid, requestedBy: S.user.uid, requestedAt: Date.now(), status: 'pending' });
+          toast('受け付けました。10分ほどで新しい仮パスワードが表示されます');
+        } catch (e) { toast(errMsg(e)); }
+      }, 'btn small'));
+    }
     if (fns && student) {
       actions.append(confirmButton('パスワード再発行', 'もう一度押すと再発行', async () => {
         try { const r = await call('resetPassword')({ uid: u.uid }); u.mustChangePassword = true; fill(pwCell, h('span', { class: 'num' }, `新しいパスワード: ${r.data.password}`)); }
@@ -2189,7 +2233,7 @@ async function viewUsers() {
         const names = student ? classNames(u.classIds, classes) : classes.filter((c) => (c.teacherIds || []).includes(u.uid)).map((c) => c.name);
         return names.length ? names.join('、') : h('span', { class: student ? 'pill warn' : 'muted' }, student ? '未所属' : '—');
       })()),
-      pwCell, actions);
+      pwCell, h('td', null, actions));
 
     function editRow() {
       const nm = h('input', { type: 'text', value: u.displayName, maxlength: 40, 'aria-label': '名前' });
@@ -2249,7 +2293,7 @@ async function viewUsers() {
 
   mount(
     h('div', { class: 'page-head' }, h('div', null, h('div', { class: 'eyebrow' }, '先生用'), h('h1', null, '生徒・アカウント'))),
-    !fns ? h('p', { class: 'notice small' }, '生徒がパスワードを忘れた場合: Cloud Functions を有効にすると、この画面から再発行できます（README参照）。有効にしていない場合は、Firebase コンソールの Authentication でその生徒を削除し、ここで同じ出席番号のアカウントを作り直してください（記録は引き継がれません）。') : null,
+    !fns ? h('p', { class: 'notice small' }, '生徒がパスワードを忘れたら、下の一覧でその生徒の「パスワード再発行」を押してください。10分ほどで新しい仮パスワードが「パスワード」の欄に表示されます（点数などの記録はそのまま残ります）。') : null,
     bulkCard,
     h('section', { class: 'stack' }, h('div', { class: 'row' }, h('h2', null, 'アカウント一覧'), h('span', { class: 'spacer' }), h('span', { class: 'label' }, '絞り込み'), filterSel), listBox),
     teacherCard,
